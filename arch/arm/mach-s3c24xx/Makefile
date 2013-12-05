@@ -84,6 +84,7 @@ obj-$(CONFIG_MACH_S3C2416_DT)		+= mach-s3c2416-dt.o
 obj-$(CONFIG_MACH_ANUBIS)		+= mach-anubis.o
 obj-$(CONFIG_MACH_AT2440EVB)		+= mach-at2440evb.o
 obj-$(CONFIG_MACH_MINI2440)		+= mach-mini2440.o
+obj-$(CONFIG_MACH_TQ2440)		+= mach-tq2440.o
 obj-$(CONFIG_MACH_NEXCODER_2440)	+= mach-nexcoder.o
 obj-$(CONFIG_MACH_OSIRIS)		+= mach-osiris.o
 obj-$(CONFIG_MACH_RX3715)		+= mach-rx3715.o
