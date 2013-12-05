@@ -1,12 +1,13 @@
-/* linux/arch/arm/mach-s3c2440/mach-mini2440.c
+/* linux/arch/arm/mach-s3c2440/mach-tq2440.c
+ *
+ * Copyright (c) 2013 Zhang Tong <lovewilliam@gmail.com>
+ * 	Largely based on mach-mini2440.c by Ramax Lo
  *
  * Copyright (c) 2008 Ramax Lo <ramaxlo@gmail.com>
  *      Based on mach-anubis.c by Ben Dooks <ben@simtec.co.uk>
  *      and modifications by SBZ <sbz@spgui.org> and
  *      Weibing <http://weibing.blogbus.com> and
  *      Michel Pollet <buserror@gmail.com>
- *
- * For product information, visit http://code.google.com/p/mini2440/
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License version 2 as
@@ -178,64 +179,31 @@ static struct platform_device tq2440_device_eth = {
 	},
 };
 
-/*  CON5
- *	+--+	 /-----\
- *	|  |    |	|
- *	|  |	|  BAT	|
- *	|  |	 \_____/
- *	|  |
- *	|  |  +----+  +----+
- *	|  |  | K5 |  | K1 |
- *	|  |  +----+  +----+
- *	|  |  +----+  +----+
- *	|  |  | K4 |  | K2 |
- *	|  |  +----+  +----+
- *	|  |  +----+  +----+
- *	|  |  | K6 |  | K3 |
- *	|  |  +----+  +----+
- *	  .....
- */
 static struct gpio_keys_button tq2440_buttons[] = {
 	{
-		.gpio		= S3C2410_GPG(0),		/* K1 */
+		.gpio		= S3C2410_GPF(1),		/* K1 */
 		.code		= KEY_F1,
 		.desc		= "Button 1",
 		.active_low	= 1,
 	},
 	{
-		.gpio		= S3C2410_GPG(3),		/* K2 */
+		.gpio		= S3C2410_GPF(4),		/* K2 */
 		.code		= KEY_F2,
 		.desc		= "Button 2",
 		.active_low	= 1,
 	},
 	{
-		.gpio		= S3C2410_GPG(5),		/* K3 */
+		.gpio		= S3C2410_GPF(2),		/* K3 */
 		.code		= KEY_F3,
 		.desc		= "Button 3",
 		.active_low	= 1,
 	},
 	{
-		.gpio		= S3C2410_GPG(6),		/* K4 */
-		.code		= KEY_POWER,
-		.desc		= "Power",
+		.gpio		= S3C2410_GPF(0),		/* K4 */
+		.code		= KEY_F4,
+		.desc		= "Button 4",
 		.active_low	= 1,
 	},
-	{
-		.gpio		= S3C2410_GPG(7),		/* K5 */
-		.code		= KEY_F5,
-		.desc		= "Button 5",
-		.active_low	= 1,
-	},
-#if 0
-	/* this pin is also known as TCLK1 and seems to already
-	 * marked as "in use" somehow in the kernel -- possibly wrongly */
-	{
-		.gpio		= S3C2410_GPG(11),	/* K6 */
-		.code		= KEY_F6,
-		.desc		= "Button 6",
-		.active_low	= 1,
-	},
-#endif
 };
 
 static struct gpio_keys_platform_data tq2440_button_data = {
