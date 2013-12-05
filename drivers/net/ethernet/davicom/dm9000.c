@@ -42,6 +42,12 @@
 #include <asm/irq.h>
 #include <asm/io.h>
 
+#if defined(CONFIG_MACH_TQ2440)
+#define S3C2410_BWSCON_DW4_16		(1<<16)
+#define S3C2410_BWSCON_WS4		(1<<18)
+#include <../regs-mem.h>
+#endif 
+
 #include "dm9000.h"
 
 /* Board/System/Debug information/definition ---------------- */
@@ -1412,13 +1418,19 @@ dm9000_probe(struct platform_device *pdev)
 	int iosize;
 	int i;
 	u32 id_val;
-
+#if defined(CONFIG_MACH_TQ2440)
+	unsigned int oldval_bwscon;
+	unsigned int oldval_bankcon4;
+#endif
 	if (!pdata) {
 		pdata = dm9000_parse_dt(&pdev->dev);
 		if (IS_ERR(pdata))
 			return PTR_ERR(pdata);
 	}
-
+#if defined(CONFIG_MACH_TQ2440)
+	oldval_bwscon = *(volatile unsigned int *)S3C2410_BWSCON;
+	oldval_bankcon4 = *(volatile unsigned int *)S3C2410_BANKCON4;
+#endif
 	/* Init network device */
 	ndev = alloc_etherdev(sizeof(struct board_info));
 	if (!ndev)
@@ -1427,6 +1439,12 @@ dm9000_probe(struct platform_device *pdev)
 	SET_NETDEV_DEV(ndev, &pdev->dev);
 
 	dev_dbg(&pdev->dev, "dm9000_probe()\n");
+
+#if defined(CONFIG_MACH_TQ2440) /* Bank4: buswidth 16, enable nWAIT*/
+	*((volatile unsigned int *)S3C2410_BWSCON) = (oldval_bwscon & ~(3<<16)) |
+		S3C2410_BWSCON_DW4_16 | S3C2410_BWSCON_WS4 | S3C2410_BWSCON_ST4; /* Bandk4 */
+	*((volatile unsigned int *)S3C2410_BANKCON4) = 0x1f7c;
+#endif
 
 	/* setup board info structure */
 	db = netdev_priv(ndev);
@@ -1654,6 +1672,11 @@ dm9000_probe(struct platform_device *pdev)
 	return 0;
 
 out:
+#if defined(CONFIG_MACH_TQ2440)
+	*(volatile unsigned int *)S3C2410_BWSCON = oldval_bwscon;
+	*(volatile unsigned int *)S3C2410_BANKCON4 = oldval_bankcon4;
+#endif
+
 	dev_err(db->dev, "not found (%d).\n", ret);
 
 	dm9000_release_board(pdev, db);

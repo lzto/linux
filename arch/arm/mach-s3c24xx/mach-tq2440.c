@@ -24,7 +24,6 @@
 #include <linux/io.h>
 #include <linux/serial_core.h>
 #include <linux/dm9000.h>
-#include <linux/i2c/at24.h>
 #include <linux/platform_device.h>
 #include <linux/gpio_keys.h>
 #include <linux/i2c.h>
@@ -145,8 +144,8 @@ static struct s3c2410_nand_set tq2440_nand_sets[] __initdata = {
 
 static struct s3c2410_platform_nand tq2440_nand_info __initdata = {
 	.tacls		= 0,
-	.twrph0		= 25,
-	.twrph1		= 15,
+	.twrph0		= 20,
+	.twrph1		= 10,
 	.nr_sets	= ARRAY_SIZE(tq2440_nand_sets),
 	.sets		= tq2440_nand_sets,
 	.ignore_unset_ecc = 1,
@@ -332,20 +331,6 @@ static struct platform_device tq2440_audio = {
 	},
 };
 
-/*
- * I2C devices
- */
-static struct at24_platform_data at24c08 = {
-	.byte_len	= SZ_8K / 8,
-	.page_size	= 16,
-};
-
-static struct i2c_board_info tq2440_i2c_devs[] __initdata = {
-	{
-		I2C_BOARD_INFO("24c08", 0x50),
-		.platform_data = &at24c08,
-	},
-};
 
 static struct platform_device uda1340_codec = {
 		.name = "uda134x-codec",
@@ -425,8 +410,6 @@ static void __init tq2440_init(void)
 	s3c_nand_set_platdata(&tq2440_nand_info);
 	s3c_i2c0_set_platdata(NULL);
 
-	i2c_register_board_info(0, tq2440_i2c_devs,
-				ARRAY_SIZE(tq2440_i2c_devs));
 
 	platform_add_devices(tq2440_devices, ARRAY_SIZE(tq2440_devices));
 
