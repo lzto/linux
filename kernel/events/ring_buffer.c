@@ -178,7 +178,9 @@ int perf_output_begin(struct perf_output_handle *handle,
 	handle->size = (1UL << page_shift) - offset;
 
 	if (unlikely(have_lost)) {
-		struct perf_sample_data sample_data;
+		struct perf_sample_data sample_data = {
+			.time = 0,
+		};
 
 		lost_event.header.size = sizeof(lost_event);
 		lost_event.header.type = PERF_RECORD_LOST;

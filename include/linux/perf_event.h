@@ -815,6 +815,7 @@ static inline void perf_sample_data_init(struct perf_sample_data *data,
 	data->weight = 0;
 	data->data_src.val = PERF_MEM_NA;
 	data->txn = 0;
+	data->time = 0;
 }
 
 extern void perf_output_sample(struct perf_output_handle *handle,
