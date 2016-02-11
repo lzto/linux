@@ -765,6 +765,7 @@ struct perf_sample_data {
 	u64				period;
 	u64				weight;
 	u64				txn;
+	u64				time;
 	union  perf_mem_data_src	data_src;
 
 	/*
@@ -777,7 +778,6 @@ struct perf_sample_data {
 		u32	pid;
 		u32	tid;
 	}				tid_entry;
-	u64				time;
 	u64				id;
 	u64				stream_id;
 	struct {
