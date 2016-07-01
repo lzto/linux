@@ -16,6 +16,7 @@
 #include <linux/mmu_notifier.h>
 #include <linux/page_idle.h>
 #include <linux/shmem_fs.h>
+#include <linux/syscalls.h>
 
 #include <asm/elf.h>
 #include <linux/uaccess.h>
@@ -1769,3 +1770,32 @@ const struct file_operations proc_tid_numa_maps_operations = {
 	.release	= proc_map_release,
 };
 #endif /* CONFIG_NUMA */
+
+struct pmap {
+	unsigned long start_stack;
+	unsigned long end_stack;
+	unsigned long start_brk;
+	unsigned long end_brk;
+};
+
+/*
+ * process stack and heap info getter accelration
+ */
+SYSCALL_DEFINE1(getpmap ,char __user* , mapinfo)
+{
+	struct mm_struct *mm = current->mm;
+	/*printk("called sys_getpmap\n"
+		"  stack - 0x%lx\n"
+		"  heap - 0x%lx, 0x%lx\n",
+		mm->start_stack,
+		mm->start_brk,
+		mm->brk);*/
+	struct pmap pmap = {
+		mm->start_stack,
+		0,
+		mm->start_brk,
+		mm->brk
+	};
+	return copy_to_user(mapinfo, &pmap, sizeof(struct pmap));
+}
+
