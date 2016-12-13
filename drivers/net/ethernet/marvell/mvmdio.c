@@ -257,6 +257,29 @@ static int orion_mdio_xsmi_write(struct mii_bus *bus, int mii_id,
 
 	return 0;
 }
+/*
+static int orion_mdio_write(struct mii_bus *bus, int mii_id,
+			    int regnum, u16 value)
+{
+	struct orion_mdio_dev *dev = bus->priv;
+	int ret;
+
+	mutex_lock(&dev->lock);
+
+	ret = orion_mdio_wait_ready(bus);
+	if (ret < 0)
+		goto out;
+
+	writel(((mii_id << MVMDIO_SMI_PHY_ADDR_SHIFT) |
+		(regnum << MVMDIO_SMI_PHY_REG_SHIFT)  |
+		MVMDIO_SMI_WRITE_OPERATION            |
+		(value << MVMDIO_SMI_DATA_SHIFT)),
+	       dev->regs);
+
+out:
+	mutex_unlock(&dev->lock);
+	return ret;
+}*/
 
 static irqreturn_t orion_mdio_err_irq(int irq, void *dev_id)
 {
@@ -272,6 +295,45 @@ static irqreturn_t orion_mdio_err_irq(int irq, void *dev_id)
 
 	return IRQ_NONE;
 }
+
+#ifdef CONFIG_MACH_ARMADA_370
+#include <linux/reboot.h>
+
+static struct mii_bus *buffalo_ls400_mii;
+
+static int buffalo_ls400_reboot_notify(struct notifier_block *nb,
+					unsigned long action, void *command)
+{
+	int reg;
+
+	if (buffalo_ls400_mii) {
+		/* switch to page 3 */
+		orion_mdio_smi_write(buffalo_ls400_mii, 0, 0x16, 0x0003);
+		/*
+		 * force INIT/STATUS[2] state to
+		 *	on: 	for reboot 
+		 *	off: 	for power off
+		 */
+		reg = orion_mdio_smi_read(buffalo_ls400_mii, 0, 0x10);
+		reg &= ~0x0f00;
+		if (action == SYS_POWER_OFF)
+			reg |= 0x0800;
+		else
+			reg |= 0x0900;
+		orion_mdio_smi_write(buffalo_ls400_mii, 0, 0x10, reg);
+
+		/* switch back to page 0 */
+		orion_mdio_smi_write(buffalo_ls400_mii, 0, 0x16, 0x0000);
+	}
+
+	return NOTIFY_OK;
+}
+
+static struct notifier_block buffalo_ls400_reboot_nb = {
+	.notifier_call = buffalo_ls400_reboot_notify,
+};
+#endif
+
 
 static int orion_mdio_probe(struct platform_device *pdev)
 {
@@ -357,6 +419,13 @@ static int orion_mdio_probe(struct platform_device *pdev)
 	}
 
 	platform_set_drvdata(pdev, bus);
+
+#ifdef CONFIG_MACH_ARMADA_370
+	if (of_machine_is_compatible("buffalo,ls42x")) {
+		buffalo_ls400_mii = bus;
+		register_reboot_notifier(&buffalo_ls400_reboot_nb);
+	}
+#endif
 
 	return 0;
 
