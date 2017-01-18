@@ -1773,10 +1773,15 @@ const struct file_operations proc_tid_numa_maps_operations = {
 };
 #endif /* CONFIG_NUMA */
 
-struct pmap {
+struct _pmap {
 	unsigned long start_mpx;
 	unsigned long end_mpx;
 };
+
+struct pmap {
+    unsigned long me_cnt;
+    struct _pmap pmap[16];
+}__attribute__((aligned(16)));
 
 /*
  * process stack and heap info getter accelration
@@ -1784,16 +1789,19 @@ struct pmap {
 SYSCALL_DEFINE1(getpmap ,char __user* , mapinfo)
 {
     struct vm_area_struct *vma = current->mm->mmap;
-	struct pmap pmap = {0,0};
+    struct pmap pmap = {0};
+    unsigned long pmap_cnt = 0;
     do {
         if (vma->vm_flags & VM_MPX)
         {
-            pmap.start_mpx = vma->vm_start;
-            pmap.end_mpx = vma->vm_end;
-            break;
+            pmap.pmap[pmap_cnt].start_mpx = vma->vm_start;
+            pmap.pmap[pmap_cnt].end_mpx = vma->vm_end;
+            pmap_cnt++;
         }
         vma = vma->vm_next;
-    }while (vma);
-	return copy_to_user(mapinfo, &pmap, sizeof(struct pmap));
+    }while (vma && (pmap_cnt<16));
+    pmap.me_cnt = pmap_cnt;
+	return copy_to_user(mapinfo, &pmap,
+        pmap_cnt*sizeof(struct _pmap) + sizeof(unsigned long) );
 }
 
