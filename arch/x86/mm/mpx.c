@@ -51,8 +51,14 @@ static unsigned long mpx_mmap(unsigned long len)
 		return -EINVAL;
 
 	down_write(&mm->mmap_sem);
+    //when bounds table got allocated we want it to be PROT_NONE
+    /*
 	addr = do_mmap(NULL, 0, len, PROT_READ | PROT_WRITE,
 		       MAP_ANONYMOUS | MAP_PRIVATE, VM_MPX, 0, &populate, NULL);
+               */
+	addr = do_mmap(NULL, 0, len, PROT_NONE,
+		       MAP_ANONYMOUS | MAP_PRIVATE, VM_MPX, 0, &populate, NULL);
+
 	up_write(&mm->mmap_sem);
 	if (populate)
 		mm_populate(addr, populate);
