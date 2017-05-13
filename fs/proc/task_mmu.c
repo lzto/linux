@@ -1771,14 +1771,17 @@ const struct file_operations proc_tid_numa_maps_operations = {
 };
 #endif /* CONFIG_NUMA */
 
-struct _pmap {
-	unsigned long start_mpx;
-	unsigned long end_mpx;
+//////////////////////////////////////////////////////////////////////////
+//pmap accelratoion
+
+enum {
+    PMAP_SUCCESS,
+    PMAP_OVERFLOW
 };
 
 struct pmap {
-    unsigned long me_cnt;
-    struct _pmap pmap[16];
+    unsigned long cnt;
+    unsigned long addr[0];//could be multiple addresses
 }__attribute__((aligned(16)));
 
 /*
@@ -1786,20 +1789,72 @@ struct pmap {
  */
 SYSCALL_DEFINE1(getpmap ,char __user* , mapinfo)
 {
+    int ret = PMAP_SUCCESS;
     struct vm_area_struct *vma = current->mm->mmap;
-    struct pmap pmap = {0};
     unsigned long pmap_cnt = 0;
+    unsigned long pmap_max;
+    struct pmap* user_pmap = (struct pmap*)mapinfo;
+    int r;
+    r = copy_from_user(&pmap_max, mapinfo, sizeof(unsigned long));
+    if (r)
+    {
+        return -EFAULT;
+    }
+
     do {
         if (vma->vm_flags & VM_MPX)
         {
-            pmap.pmap[pmap_cnt].start_mpx = vma->vm_start;
-            pmap.pmap[pmap_cnt].end_mpx = vma->vm_end;
-            pmap_cnt++;
+            //findout pages which has been accessed
+            unsigned long start = vma->vm_start;
+            unsigned long end = vma->vm_end;
+            unsigned int level;
+
+            while (start<end)
+            {
+                pgd_t* pgd = pgd_offset(current->mm,start);
+                pte_t* pte = lookup_address_in_pgd(pgd, start, &level);
+                if (pte==NULL)
+                {
+                    start+=PAGE_SIZE;
+                    continue;
+                }
+                /*
+                 * MPX bt page should be at least written to in order to be considered
+                 * touched, a page that has never been written to should be clean
+                 * and don't need special treatment
+                 */
+                if (pte_young(*pte) && pte_dirty(*pte))
+                {
+                    //accessed page, return to user
+                    r = copy_to_user(&(user_pmap->addr[pmap_cnt]),
+                                &start, sizeof(unsigned long));
+                    if (r)
+                    {
+                        return -EFAULT;
+                    }
+                    pmap_cnt++;
+                    if (pmap_cnt>=pmap_max)
+                    {
+                        ret = PMAP_OVERFLOW;
+                        break;
+                    }
+                }
+                start+=PAGE_SIZE;
+            }
         }
         vma = vma->vm_next;
-    }while (vma && (pmap_cnt<16));
-    pmap.me_cnt = pmap_cnt;
-	return copy_to_user(mapinfo, &pmap,
-        pmap_cnt*sizeof(struct _pmap) + sizeof(unsigned long) );
+        if (pmap_cnt>=pmap_max)
+        {
+            ret = PMAP_OVERFLOW;
+            break;
+        }
+    }while (vma);
+
+	r = copy_to_user(&(user_pmap->cnt), &pmap_cnt, sizeof(unsigned long) );
+    if (r)
+    {
+        return -EFAULT;
+    }
+    return ret;
 }
 
