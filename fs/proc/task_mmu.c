@@ -1779,9 +1779,14 @@ enum {
     PMAP_OVERFLOW
 };
 
+struct pmap_segment {
+    unsigned long addr;//page address
+    unsigned short length;//how many pages are there
+};
+
 struct pmap {
     unsigned long cnt;
-    unsigned long addr[0];//could be multiple addresses
+    struct pmap_segment segs[0];//could be multiple segments
 }__attribute__((aligned(16)));
 
 /*
@@ -1792,15 +1797,16 @@ SYSCALL_DEFINE1(getpmap ,char __user* , mapinfo)
     int ret = PMAP_SUCCESS;
     struct vm_area_struct *vma = current->mm->mmap;
     unsigned long pmap_cnt = 0;
+    //user buffer size
     unsigned long pmap_max;
     struct pmap* user_pmap = (struct pmap*)mapinfo;
+    struct pmap_segment seg;
     int r;
     r = copy_from_user(&pmap_max, mapinfo, sizeof(unsigned long));
     if (r)
     {
         return -EFAULT;
     }
-
     do {
         if (vma->vm_flags & VM_MPX)
         {
@@ -1808,30 +1814,38 @@ SYSCALL_DEFINE1(getpmap ,char __user* , mapinfo)
             unsigned long start = vma->vm_start;
             unsigned long end = vma->vm_end;
             unsigned int level;
-
+            seg.addr = 0;
+            seg.length = 0;
             while (start<end)
             {
                 pgd_t* pgd = pgd_offset(current->mm,start);
                 pte_t* pte = lookup_address_in_pgd(pgd, start, &level);
-                if (pte==NULL)
-                {
-                    start+=PAGE_SIZE;
-                    continue;
-                }
                 /*
                  * MPX bt page should be at least written to in order to be considered
                  * touched, a page that has never been written to should be clean
                  * and don't need special treatment
                  */
-                if (pte_young(*pte) && pte_dirty(*pte))
+                if (pte && pte_young(*pte) && pte_dirty(*pte))
                 {
                     //accessed page, return to user
-                    r = copy_to_user(&(user_pmap->addr[pmap_cnt]),
-                                &start, sizeof(unsigned long));
+                    if (seg.length==0)
+                    {
+                        seg.addr = start;
+                        seg.length = 1;
+                    }else
+                    {
+                        seg.length++;
+                    }
+                }else if (seg.length!=0)
+                {
+                    r = copy_to_user(&(user_pmap->segs[pmap_cnt]),
+                                &seg, sizeof(struct pmap_segment));
                     if (r)
                     {
                         return -EFAULT;
                     }
+                    seg.addr = 0;
+                    seg.length = 0;
                     pmap_cnt++;
                     if (pmap_cnt>=pmap_max)
                     {
@@ -1843,11 +1857,6 @@ SYSCALL_DEFINE1(getpmap ,char __user* , mapinfo)
             }
         }
         vma = vma->vm_next;
-        if (pmap_cnt>=pmap_max)
-        {
-            ret = PMAP_OVERFLOW;
-            break;
-        }
     }while (vma);
 
 	r = copy_to_user(&(user_pmap->cnt), &pmap_cnt, sizeof(unsigned long) );
