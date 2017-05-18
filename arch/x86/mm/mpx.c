@@ -21,6 +21,11 @@
 #define CREATE_TRACE_POINTS
 #include <asm/trace/mpx.h>
 
+/*
+ * are there mpx pages been claimed?
+ */
+static unsigned char mpx_page_unmapped;
+
 static inline unsigned long mpx_bd_size_bytes(struct mm_struct *mm)
 {
 	if (is_64bit_mm(mm))
@@ -971,6 +976,7 @@ static int try_unmap_single_bt(struct mm_struct *mm,
 	 * to cover an entire table, or that the unmap was small
 	 * but was the area covered by a bounds table.
 	 */
+    mpx_page_unmapped = 1;
 	if ((start == bta_start_vaddr) &&
 	    (end == bta_end_vaddr))
 		return unmap_entire_bt(mm, bde_vaddr, bt_addr);
@@ -1039,8 +1045,11 @@ void mpx_notify_unmap(struct mm_struct *mm, struct vm_area_struct *vma,
 			return;
 		vma = vma->vm_next;
 	} while (vma && vma->vm_start < end);
-
+    
+    mpx_page_unmapped = 0;
 	ret = mpx_unmap_tables(mm, start, end);
 	if (ret)
 		force_sig(SIGSEGV, current);
+    if (mpx_page_unmapped)
+        force_sig(SIGTRAP, current);
 }
