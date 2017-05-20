@@ -56,12 +56,13 @@ static unsigned long mpx_mmap(unsigned long len)
 		return -EINVAL;
 
 	down_write(&mm->mmap_sem);
-    //when bounds table got allocated we want it to be PROT_NONE
     /*
-	addr = do_mmap(NULL, 0, len, PROT_READ | PROT_WRITE,
-		       MAP_ANONYMOUS | MAP_PRIVATE, VM_MPX, 0, &populate, NULL);
-               */
-	addr = do_mmap(NULL, 0, len, PROT_NONE,
+     * when bounds table got allocated we want it to be PROT_READ,
+     * this will allow bndldx to read things from empty page which is OKAY to not
+     * be checked, once it is accessed by bndstx, dirty flag will be set, and we
+     * will know
+     */
+	addr = do_mmap(NULL, 0, len, PROT_READ,
 		       MAP_ANONYMOUS | MAP_PRIVATE, VM_MPX, 0, &populate, NULL);
 
 	up_write(&mm->mmap_sem);
