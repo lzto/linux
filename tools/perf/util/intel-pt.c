@@ -1639,7 +1639,7 @@ static int intel_pt_process_event(struct perf_session *session,
 				  struct perf_sample *sample,
 				  struct perf_tool *tool)
 {
-	struct intel_pt *pt = container_of(session->auxtrace, struct intel_pt,
+	struct intel_pt *pt = container_of(session->auxtrace_pt, struct intel_pt,
 					   auxtrace);
 	u64 timestamp;
 	int err = 0;
@@ -1700,7 +1700,7 @@ static int intel_pt_process_event(struct perf_session *session,
 
 static int intel_pt_flush(struct perf_session *session, struct perf_tool *tool)
 {
-	struct intel_pt *pt = container_of(session->auxtrace, struct intel_pt,
+	struct intel_pt *pt = container_of(session->auxtrace_pt, struct intel_pt,
 					   auxtrace);
 	int ret;
 
@@ -1723,7 +1723,7 @@ static int intel_pt_flush(struct perf_session *session, struct perf_tool *tool)
 
 static void intel_pt_free_events(struct perf_session *session)
 {
-	struct intel_pt *pt = container_of(session->auxtrace, struct intel_pt,
+	struct intel_pt *pt = container_of(session->auxtrace_pt, struct intel_pt,
 					   auxtrace);
 	struct auxtrace_queues *queues = &pt->queues;
 	unsigned int i;
@@ -1738,12 +1738,12 @@ static void intel_pt_free_events(struct perf_session *session)
 
 static void intel_pt_free(struct perf_session *session)
 {
-	struct intel_pt *pt = container_of(session->auxtrace, struct intel_pt,
+	struct intel_pt *pt = container_of(session->auxtrace_pt, struct intel_pt,
 					   auxtrace);
 
 	auxtrace_heap__free(&pt->heap);
 	intel_pt_free_events(session);
-	session->auxtrace = NULL;
+	session->auxtrace_pt = NULL;
 	thread__put(pt->unknown_thread);
 	free(pt);
 }
@@ -1752,7 +1752,7 @@ static int intel_pt_process_auxtrace_event(struct perf_session *session,
 					   union perf_event *event,
 					   struct perf_tool *tool __maybe_unused)
 {
-	struct intel_pt *pt = container_of(session->auxtrace, struct intel_pt,
+	struct intel_pt *pt = container_of(session->auxtrace_pt, struct intel_pt,
 					   auxtrace);
 
 	if (pt->sampling_mode)
@@ -2090,7 +2090,7 @@ int intel_pt_process_auxtrace_info(union perf_event *event,
 	pt->auxtrace.flush_events = intel_pt_flush;
 	pt->auxtrace.free_events = intel_pt_free_events;
 	pt->auxtrace.free = intel_pt_free;
-	session->auxtrace = &pt->auxtrace;
+	session->auxtrace_pt = &pt->auxtrace;
 
 	if (dump_trace)
 		return 0;
@@ -2166,7 +2166,7 @@ err_delete_thread:
 err_free_queues:
 	intel_pt_log_disable();
 	auxtrace_queues__free(&pt->queues);
-	session->auxtrace = NULL;
+	session->auxtrace_pt = NULL;
 err_free:
 	free(pt);
 	return err;

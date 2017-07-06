@@ -127,6 +127,11 @@ struct hw_perf_event {
 		};
 		struct { /* itrace */
 			int			itrace_started;
+			/*
+			 * PMU would store hardware filter configuration
+			 * here.
+			 */
+			void			*itrace_filters;
 		};
 #ifdef CONFIG_HAVE_HW_BREAKPOINT
 		struct { /* breakpoint */
@@ -388,9 +393,35 @@ struct pmu {
 	void (*free_aux)		(void *aux); /* optional */
 
 	/*
+	 * Validate instruction tracing filters: make sure hw supports the
+	 * requested configuration and number of filters.
+	 *
+	 * Configure instruction tracing filters: translate hw-agnostic filter
+	 * into hardware configuration in event::hw::itrace_filters
+	 */
+	int (*itrace_filter_setup)	(struct perf_event *event); /* optional */
+
+	/*
 	 * Filter events for PMU-specific reasons.
 	 */
 	int (*filter_match)		(struct perf_event *event); /* optional */
+};
+
+/**
+ * Instruction trace (ITRACE) filter
+ */
+struct perf_itrace_filter {
+	struct list_head	entry;
+	struct rcu_head		rcu_head;
+	struct inode		*inode;
+	struct task_struct	*task;
+	unsigned long		offset;
+	unsigned long		size;
+	unsigned long		start;
+	unsigned long		end;
+	unsigned int		range	: 1, /* 1: range, 0: addr */
+				filter	: 1, /* 1: filter/start, 0: stop */
+				kernel	: 1; /* 1: kernel, 0: object file*/
 };
 
 /**
@@ -560,6 +591,10 @@ struct perf_event {
 
 	atomic_t			event_limit;
 
+	/* instruction trace filters */
+	struct list_head		itrace_filters;
+	struct mutex			itrace_filters_mutex;
+
 	void (*destroy)(struct perf_event *);
 	struct rcu_head			rcu_head;
 
@@ -706,13 +741,23 @@ perf_cgroup_from_task(struct task_struct *task, struct perf_event_context *ctx)
 
 #ifdef CONFIG_PERF_EVENTS
 
-extern void *perf_aux_output_begin(struct perf_output_handle *handle,
+extern void *perf_aux_output_begin_pt(struct perf_output_handle *handle,
 				   struct perf_event *event);
-extern void perf_aux_output_end(struct perf_output_handle *handle,
+extern void perf_aux_output_end_pt(struct perf_output_handle *handle,
 				unsigned long size, bool truncated);
-extern int perf_aux_output_skip(struct perf_output_handle *handle,
+extern int perf_aux_output_skip_pt(struct perf_output_handle *handle,
 				unsigned long size);
-extern void *perf_get_aux(struct perf_output_handle *handle);
+
+extern void *perf_aux_output_begin_pebs(struct perf_output_handle *handle,
+				   struct perf_event *event);
+extern void perf_aux_output_end_pebs(struct perf_output_handle *handle,
+				unsigned long size, bool truncated);
+
+extern int perf_aux_output_skip_pebs(struct perf_output_handle *handle,
+				unsigned long size);
+
+extern void *perf_get_aux_pt(struct perf_output_handle *handle);
+extern void *perf_get_aux_pebs(struct perf_output_handle *handle);
 
 extern int perf_pmu_register(struct pmu *pmu, const char *name, int type);
 extern void perf_pmu_unregister(struct pmu *pmu);
@@ -763,6 +808,7 @@ struct perf_sample_data {
 	u64				period;
 	u64				weight;
 	u64				txn;
+	u64				time;
 	union  perf_mem_data_src	data_src;
 
 	/*
@@ -775,7 +821,6 @@ struct perf_sample_data {
 		u32	pid;
 		u32	tid;
 	}				tid_entry;
-	u64				time;
 	u64				id;
 	u64				stream_id;
 	struct {
@@ -813,6 +858,7 @@ static inline void perf_sample_data_init(struct perf_sample_data *data,
 	data->weight = 0;
 	data->data_src.val = PERF_MEM_NA;
 	data->txn = 0;
+	data->time = 0;
 }
 
 extern void perf_output_sample(struct perf_output_handle *handle,
@@ -1030,6 +1076,11 @@ static inline bool has_aux(struct perf_event *event)
 	return event->pmu->setup_aux;
 }
 
+static inline bool has_itrace_filter(struct perf_event *event)
+{
+	return event->pmu->itrace_filter_setup;
+}
+
 extern int perf_output_begin(struct perf_output_handle *handle,
 			     struct perf_event *event, unsigned int size);
 extern void perf_output_end(struct perf_output_handle *handle);
@@ -1046,14 +1097,24 @@ extern void perf_event_disable_local(struct perf_event *event);
 extern void perf_event_task_tick(void);
 #else /* !CONFIG_PERF_EVENTS: */
 static inline void *
-perf_aux_output_begin(struct perf_output_handle *handle,
+perf_aux_output_begin_pt(struct perf_output_handle *handle,
 		      struct perf_event *event)				{ return NULL; }
 static inline void
-perf_aux_output_end(struct perf_output_handle *handle, unsigned long size,
+perf_aux_output_end_pt(struct perf_output_handle *handle, unsigned long size,
 		    bool truncated)					{ }
 static inline int
-perf_aux_output_skip(struct perf_output_handle *handle,
+perf_aux_output_skip_pt(struct perf_output_handle *handle,
 		     unsigned long size)				{ return -EINVAL; }
+
+perf_aux_output_begin_pebs(struct perf_output_handle *handle,
+		      struct perf_event *event)				{ return NULL; }
+static inline void
+perf_aux_output_end_pebs(struct perf_output_handle *handle, unsigned long size,
+		    bool truncated)					{ }
+static inline int
+perf_aux_output_skip_pebs(struct perf_output_handle *handle,
+		     unsigned long size)				{ return -EINVAL; }
+
 static inline void *
 perf_get_aux(struct perf_output_handle *handle)				{ return NULL; }
 static inline void

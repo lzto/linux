@@ -814,6 +814,11 @@ void perf_evsel__config(struct perf_evsel *evsel, struct record_opts *opts)
 		perf_evsel__set_sample_bit(evsel, REGS_INTR);
 	}
 
+	if (opts->sample_user_regs) {
+		attr->sample_regs_user = opts->sample_user_regs;
+		perf_evsel__set_sample_bit(evsel, REGS_USER);
+	}
+
 	if (target__has_cpu(&opts->target))
 		perf_evsel__set_sample_bit(evsel, CPU);
 

@@ -1547,13 +1547,16 @@ foreach_evsel_in_last_glob(struct perf_evlist *evlist,
 static int set_filter(struct perf_evsel *evsel, const void *arg)
 {
 	const char *str = arg;
-
-	if (evsel == NULL || evsel->attr.type != PERF_TYPE_TRACEPOINT) {
+//FIXME!
+	printf("event:%s\n",evsel->name);
+	if((strncmp(evsel->name,"intel_pt",8)==0)||
+		(strncmp(evsel->name,"cpu",3)==0))
+	{
+	}else if (evsel == NULL || evsel->attr.type != PERF_TYPE_TRACEPOINT) {
 		fprintf(stderr,
 			"--filter option should follow a -e tracepoint option\n");
 		return -1;
 	}
-
 	if (perf_evsel__append_filter(evsel, "&&", str) < 0) {
 		fprintf(stderr,
 			"not enough memory to hold filter string\n");

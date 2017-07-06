@@ -376,7 +376,8 @@ struct auxtrace_event {
 	u32 idx;
 	u32 tid;
 	u32 cpu;
-	u32 reserved__; /* For alignment */
+	//u32 reserved__; /* For alignment */
+    u32 pmu;//where does this aux data comes from
 };
 
 #define MAX_AUXTRACE_ERROR_MSG 64

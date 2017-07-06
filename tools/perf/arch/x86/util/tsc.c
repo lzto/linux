@@ -35,6 +35,11 @@ int perf_read_tsc_conversion(const struct perf_event_mmap_page *pc,
 	if (!cap_user_time_zero)
 		return -EOPNOTSUPP;
 
+	printf("FF: perf_read_tsc_conversion: time_mult = %u time_shift=%u time_zero=%lu\n",
+			tc->time_mult,
+			tc->time_shift,
+			tc->time_zero);
+
 	return 0;
 }
 

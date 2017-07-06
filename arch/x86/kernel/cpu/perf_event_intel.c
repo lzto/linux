@@ -1634,7 +1634,6 @@ static void intel_pmu_nhm_enable_all(int added)
 static inline u64 intel_pmu_get_status(void)
 {
 	u64 status;
-
 	rdmsrl(MSR_CORE_PERF_GLOBAL_STATUS, status);
 
 	return status;
@@ -1645,13 +1644,12 @@ static inline void intel_pmu_ack_status(u64 ack)
 	wrmsrl(MSR_CORE_PERF_GLOBAL_OVF_CTRL, ack);
 }
 
-static void intel_pmu_disable_fixed(struct hw_perf_event *hwc)
+void intel_pmu_disable_fixed(struct hw_perf_event *hwc)
 {
 	int idx = hwc->idx - INTEL_PMC_IDX_FIXED;
 	u64 ctrl_val, mask;
 
 	mask = 0xfULL << (idx * 4);
-
 	rdmsrl(hwc->config_base, ctrl_val);
 	ctrl_val &= ~mask;
 	wrmsrl(hwc->config_base, ctrl_val);
@@ -1662,7 +1660,7 @@ static inline bool event_is_checkpointed(struct perf_event *event)
 	return (event->hw.config & HSW_IN_TX_CHECKPOINTED) != 0;
 }
 
-static void intel_pmu_disable_event(struct perf_event *event)
+void intel_pmu_disable_event(struct perf_event *event)
 {
 	struct hw_perf_event *hwc = &event->hw;
 	struct cpu_hw_events *cpuc = this_cpu_ptr(&cpu_hw_events);
@@ -1695,7 +1693,7 @@ static void intel_pmu_disable_event(struct perf_event *event)
 		intel_pmu_pebs_disable(event);
 }
 
-static void intel_pmu_enable_fixed(struct hw_perf_event *hwc)
+void intel_pmu_enable_fixed(struct hw_perf_event *hwc)
 {
 	int idx = hwc->idx - INTEL_PMC_IDX_FIXED;
 	u64 ctrl_val, bits, mask;
@@ -1726,7 +1724,7 @@ static void intel_pmu_enable_fixed(struct hw_perf_event *hwc)
 	wrmsrl(hwc->config_base, ctrl_val);
 }
 
-static void intel_pmu_enable_event(struct perf_event *event)
+void intel_pmu_enable_event(struct perf_event *event)
 {
 	struct hw_perf_event *hwc = &event->hw;
 	struct cpu_hw_events *cpuc = this_cpu_ptr(&cpu_hw_events);
@@ -1834,6 +1832,7 @@ static int intel_pmu_handle_irq(struct pt_regs *regs)
 	int bit, loops;
 	u64 status;
 	int handled;
+    int pebs_aux_irq_handler_ret;
 
 	cpuc = this_cpu_ptr(&cpu_hw_events);
 
@@ -1867,7 +1866,6 @@ again:
 
 	inc_irq_stat(apic_perf_irqs);
 
-
 	/*
 	 * Ignore a range of extra bits in status that do not indicate
 	 * overflow by themselves.
@@ -1883,7 +1881,12 @@ again:
 	 */
 	if (__test_and_clear_bit(62, (unsigned long *)&status)) {
 		handled++;
-		x86_pmu.drain_pebs(regs);
+		//Do not use drain when aux buffer is enabled
+        pebs_aux_irq_handler_ret = intel_pebs_interrupt();
+		if (pebs_aux_irq_handler_ret ==0)
+        {
+            x86_pmu.drain_pebs(regs);
+        }
 	}
 
 	/*
@@ -1919,6 +1922,9 @@ again:
 
 		if (perf_event_overflow(event, &data, regs))
 			x86_pmu_stop(event, 0);
+
+        //if (pebs_aux_irq_handler_ret<0)
+        //    x86_pmu_stop(event, 0);
 	}
 
 	/*
@@ -2602,7 +2608,8 @@ static int intel_pmu_hw_config(struct perf_event *event)
 		}
 	}
 
-	if (event->attr.type != PERF_TYPE_RAW)
+	if ((event->attr.type != PERF_TYPE_RAW) &&
+		(event->attr.type != PERF_TYPE_RAW_PEBS))
 		return 0;
 
 	if (!(event->attr.config & ARCH_PERFMON_EVENTSEL_ANY))

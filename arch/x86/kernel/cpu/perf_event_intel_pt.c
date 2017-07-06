@@ -67,11 +67,13 @@ static struct pt_cap_desc {
 	PT_CAP(max_subleaf,		0, CR_EAX, 0xffffffff),
 	PT_CAP(cr3_filtering,		0, CR_EBX, BIT(0)),
 	PT_CAP(psb_cyc,			0, CR_EBX, BIT(1)),
+	PT_CAP(ip_filtering,		0, CR_EBX, BIT(2)),
 	PT_CAP(mtc,			0, CR_EBX, BIT(3)),
 	PT_CAP(topa_output,		0, CR_ECX, BIT(0)),
 	PT_CAP(topa_multiple_entries,	0, CR_ECX, BIT(1)),
 	PT_CAP(single_range_output,	0, CR_ECX, BIT(2)),
 	PT_CAP(payloads_lip,		0, CR_ECX, BIT(31)),
+	PT_CAP(num_address_ranges,	1, CR_EAX, 0x3),
 	PT_CAP(mtc_periods,		1, CR_EAX, 0xffff0000),
 	PT_CAP(cycle_thresholds,	1, CR_EBX, 0xffff),
 	PT_CAP(psb_periods,		1, CR_EBX, 0xffff0000),
@@ -251,6 +253,73 @@ static bool pt_event_valid(struct perf_event *event)
  * These all are cpu affine and operate on a local PT
  */
 
+/* Address ranges and their corresponding msr configuration registers */
+static const struct pt_address_range {
+	unsigned long	msr_a;
+	unsigned long	msr_b;
+	unsigned int	reg_off;
+} pt_address_ranges[] = {
+	{
+		.msr_a	 = MSR_IA32_RTIT_ADDR0_A,
+		.msr_b	 = MSR_IA32_RTIT_ADDR0_B,
+		.reg_off = RTIT_CTL_ADDR0_OFFSET,
+	},
+	{
+		.msr_a	 = MSR_IA32_RTIT_ADDR1_A,
+		.msr_b	 = MSR_IA32_RTIT_ADDR1_B,
+		.reg_off = RTIT_CTL_ADDR1_OFFSET,
+	},
+	{
+		.msr_a	 = MSR_IA32_RTIT_ADDR2_A,
+		.msr_b	 = MSR_IA32_RTIT_ADDR2_B,
+		.reg_off = RTIT_CTL_ADDR2_OFFSET,
+	},
+	{
+		.msr_a	 = MSR_IA32_RTIT_ADDR3_A,
+		.msr_b	 = MSR_IA32_RTIT_ADDR3_B,
+		.reg_off = RTIT_CTL_ADDR3_OFFSET,
+	}
+};
+
+static u64 pt_config_filters(struct perf_event *event)
+{
+	struct pt_filters *filters = event->hw.itrace_filters;
+	struct pt *pt = this_cpu_ptr(&pt_ctx);
+	unsigned int range = 0;
+	u64 rtit_ctl = 0;
+
+	if (!filters)
+		return 0;
+
+	for (range = 0; range < filters->nr_filters; range++) {
+		struct pt_filter *filter = &filters->filter[range];
+
+		/*
+		 * Note, if the range has zero start/end addresses due
+		 * to its dynamic object not being loaded yet, we just
+		 * go ahead and program zeroed range, which will simply
+		 * produce no data. Note^2: if executable code at 0x0
+		 * is a concern, we can set up an "invalid" configuration
+		 * such as msr_b < msr_a.
+		 */
+
+		/* avoid redundant msr writes */
+		if (pt->filters.filter[range].msr_a != filter->msr_a) {
+			wrmsrl(pt_address_ranges[range].msr_a, filter->msr_a);
+			pt->filters.filter[range].msr_a = filter->msr_a;
+		}
+
+		if (pt->filters.filter[range].msr_b != filter->msr_b) {
+			wrmsrl(pt_address_ranges[range].msr_b, filter->msr_b);
+			pt->filters.filter[range].msr_b = filter->msr_b;
+		}
+
+		rtit_ctl |= filter->config << pt_address_ranges[range].reg_off;
+	}
+
+	return rtit_ctl;
+}
+
 static void pt_config(struct perf_event *event)
 {
 	u64 reg;
@@ -260,7 +329,8 @@ static void pt_config(struct perf_event *event)
 		wrmsrl(MSR_IA32_RTIT_STATUS, 0);
 	}
 
-	reg = RTIT_CTL_TOPA | RTIT_CTL_BRANCH_EN | RTIT_CTL_TRACEEN;
+	reg = pt_config_filters(event);
+	reg |= RTIT_CTL_TOPA | RTIT_CTL_BRANCH_EN | RTIT_CTL_TRACEEN;
 
 	if (!event->attr.exclude_kernel)
 		reg |= RTIT_CTL_OS;
@@ -524,7 +594,7 @@ static void pt_buffer_advance(struct pt_buffer *buf)
  */
 static void pt_update_head(struct pt *pt)
 {
-	struct pt_buffer *buf = perf_get_aux(&pt->handle);
+	struct pt_buffer *buf = perf_get_aux_pt(&pt->handle);
 	u64 topa_idx, base, old;
 
 	/* offset of the first region in this table from the beginning of buf */
@@ -570,7 +640,7 @@ static size_t pt_buffer_region_size(struct pt_buffer *buf)
  */
 static void pt_handle_status(struct pt *pt)
 {
-	struct pt_buffer *buf = perf_get_aux(&pt->handle);
+	struct pt_buffer *buf = perf_get_aux_pt(&pt->handle);
 	int advance = 0;
 	u64 status;
 
@@ -860,7 +930,7 @@ static int pt_buffer_init_topa(struct pt_buffer *buf, unsigned long nr_pages,
  *
  * Return:	Our private PT buffer structure.
  */
-static void *
+void *
 pt_buffer_setup_aux(int cpu, void **pages, int nr_pages, bool snapshot)
 {
 	struct pt_buffer *buf;
@@ -897,7 +967,7 @@ pt_buffer_setup_aux(int cpu, void **pages, int nr_pages, bool snapshot)
  * pt_buffer_free_aux() - perf AUX deallocation path callback
  * @data:	PT buffer.
  */
-static void pt_buffer_free_aux(void *data)
+void pt_buffer_free_aux(void *data)
 {
 	struct pt_buffer *buf = data;
 
@@ -925,6 +995,59 @@ static bool pt_buffer_is_full(struct pt_buffer *buf, struct pt *pt)
 	return false;
 }
 
+static int pt_itrace_filters_init(struct perf_event *event)
+{
+	struct pt_filters *filters;
+	int node = event->cpu == -1 ? -1 : cpu_to_node(event->cpu);
+
+	if (!pt_cap_get(PT_CAP_num_address_ranges))
+		return 0;
+
+	filters = kzalloc_node(sizeof(struct pt_filters), GFP_KERNEL, node);
+	if (!filters)
+		return -ENOMEM;
+
+	event->hw.itrace_filters = filters;
+
+	return 0;
+}
+
+static void pt_itrace_filters_fini(struct perf_event *event)
+{
+	kfree(event->hw.itrace_filters);
+	event->hw.itrace_filters = NULL;
+}
+
+static int pt_event_itrace_filter_setup(struct perf_event *event)
+{
+	struct pt_filters *filters = event->hw.itrace_filters;
+	struct perf_itrace_filter *filter;
+	int range = 0;
+
+	if (!filters)
+		return -EOPNOTSUPP;
+
+	list_for_each_entry_rcu(filter, &event->itrace_filters, entry) {
+		/* PT doesn't support single address triggers */
+		if (!filter->range)
+			return -EOPNOTSUPP;
+
+		if (filter->kernel && !kernel_ip(filter->offset))
+			return -EINVAL;
+
+		filters->filter[range].msr_a  = filter->start;
+		filters->filter[range].msr_b  = filter->end;
+		filters->filter[range].config = filter->filter ? 1 : 2;
+
+		if (++range > pt_cap_get(PT_CAP_num_address_ranges))
+			return -EOPNOTSUPP;
+	}
+
+	filters->nr_filters = range;
+
+	return 0;
+}
+
 /**
  * intel_pt_interrupt() - PT PMI handler
  */
@@ -947,7 +1070,7 @@ void intel_pt_interrupt(void)
 	if (!event)
 		return;
 
-	buf = perf_get_aux(&pt->handle);
+	buf = perf_get_aux_pt(&pt->handle);
 	if (!buf)
 		return;
 
@@ -957,13 +1080,13 @@ void intel_pt_interrupt(void)
 
 	pt_update_head(pt);
 
-	perf_aux_output_end(&pt->handle, local_xchg(&buf->data_size, 0),
+	perf_aux_output_end_pt(&pt->handle, local_xchg(&buf->data_size, 0),
 			    local_xchg(&buf->lost, 0));
 
 	if (!event->hw.state) {
 		int ret;
 
-		buf = perf_aux_output_begin(&pt->handle, event);
+		buf = perf_aux_output_begin_pt(&pt->handle, event);
 		if (!buf) {
 			event->hw.state = PERF_HES_STOPPED;
 			return;
@@ -973,7 +1096,7 @@ void intel_pt_interrupt(void)
 		/* snapshot counters don't use PMI, so it's safe */
 		ret = pt_buffer_reset_markers(buf, &pt->handle);
 		if (ret) {
-			perf_aux_output_end(&pt->handle, 0, true);
+			perf_aux_output_end_pt(&pt->handle, 0, true);
 			return;
 		}
 
@@ -990,12 +1113,14 @@ void intel_pt_interrupt(void)
 static void pt_event_start(struct perf_event *event, int mode)
 {
 	struct pt *pt = this_cpu_ptr(&pt_ctx);
-	struct pt_buffer *buf = perf_get_aux(&pt->handle);
+	struct pt_buffer *buf = perf_get_aux_pt(&pt->handle);
 
 	if (!buf || pt_buffer_is_full(buf, pt)) {
 		event->hw.state = PERF_HES_STOPPED;
 		return;
 	}
+
+	pt_event_itrace_filter_setup(event);
 
 	ACCESS_ONCE(pt->handle_nmi) = 1;
 	event->hw.state = 0;
@@ -1022,7 +1147,7 @@ static void pt_event_stop(struct perf_event *event, int mode)
 	event->hw.state = PERF_HES_STOPPED;
 
 	if (mode & PERF_EF_UPDATE) {
-		struct pt_buffer *buf = perf_get_aux(&pt->handle);
+		struct pt_buffer *buf = perf_get_aux_pt(&pt->handle);
 
 		if (!buf)
 			return;
@@ -1045,14 +1170,14 @@ static void pt_event_del(struct perf_event *event, int mode)
 
 	pt_event_stop(event, PERF_EF_UPDATE);
 
-	buf = perf_get_aux(&pt->handle);
+	buf = perf_get_aux_pt(&pt->handle);
 
 	if (buf) {
 		if (buf->snapshot)
 			pt->handle.head =
 				local_xchg(&buf->data_size,
 					   buf->nr_pages << PAGE_SHIFT);
-		perf_aux_output_end(&pt->handle, local_xchg(&buf->data_size, 0),
+		perf_aux_output_end_pt(&pt->handle, local_xchg(&buf->data_size, 0),
 				    local_xchg(&buf->lost, 0));
 	}
 }
@@ -1067,7 +1192,7 @@ static int pt_event_add(struct perf_event *event, int mode)
 	if (pt->handle.event)
 		goto fail;
 
-	buf = perf_aux_output_begin(&pt->handle, event);
+	buf = perf_aux_output_begin_pt(&pt->handle, event);
 	ret = -EINVAL;
 	if (!buf)
 		goto fail_stop;
@@ -1091,7 +1216,7 @@ static int pt_event_add(struct perf_event *event, int mode)
 	return 0;
 
 fail_end_stop:
-	perf_aux_output_end(&pt->handle, 0, true);
+	perf_aux_output_end_pt(&pt->handle, 0, true);
 fail_stop:
 	hwc->state = PERF_HES_STOPPED;
 fail:
@@ -1104,6 +1229,7 @@ static void pt_event_read(struct perf_event *event)
 
 static void pt_event_destroy(struct perf_event *event)
 {
+	pt_itrace_filters_fini(event);
 	x86_del_exclusive(x86_lbr_exclusive_pt);
 }
 
@@ -1117,6 +1243,11 @@ static int pt_event_init(struct perf_event *event)
 
 	if (x86_add_exclusive(x86_lbr_exclusive_pt))
 		return -EBUSY;
+
+	if (pt_itrace_filters_init(event)) {
+		x86_del_exclusive(x86_lbr_exclusive_pt);
+		return -ENOMEM;
+	}
 
 	event->destroy = pt_event_destroy;
 
@@ -1181,6 +1312,8 @@ static __init int pt_init(void)
 	pt_pmu.pmu.read		= pt_event_read;
 	pt_pmu.pmu.setup_aux	= pt_buffer_setup_aux;
 	pt_pmu.pmu.free_aux	= pt_buffer_free_aux;
+	pt_pmu.pmu.itrace_filter_setup =
+		pt_event_itrace_filter_setup;
 	ret = perf_pmu_register(&pt_pmu.pmu, "intel_pt", -1);
 
 	return ret;

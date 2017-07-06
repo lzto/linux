@@ -30,7 +30,8 @@ struct perf_mmap {
 	int		 mask;
 	atomic_t	 refcnt;
 	u64		 prev;
-	struct auxtrace_mmap auxtrace_mmap;
+	struct auxtrace_mmap auxtrace_mmap_pt;
+	struct auxtrace_mmap auxtrace_mmap_pebs;
 	char		 event_copy[PERF_SAMPLE_MAX_SIZE] __attribute__((aligned(8)));
 };
 

@@ -32,7 +32,7 @@ enum perf_type_id {
 	PERF_TYPE_HW_CACHE			= 3,
 	PERF_TYPE_RAW				= 4,
 	PERF_TYPE_BREAKPOINT			= 5,
-
+	PERF_TYPE_RAW_PEBS			= 8,
 	PERF_TYPE_MAX,				/* non-ABI */
 };
 
@@ -561,10 +561,15 @@ struct perf_event_mmap_page {
 	 * Ring buffer pointers aux_{head,tail} have the same semantics as
 	 * data_{head,tail} and same ordering rules apply.
 	 */
-	__u64	aux_head;
-	__u64	aux_tail;
-	__u64	aux_offset;
-	__u64	aux_size;
+	__u64	aux_head_pt;
+	__u64	aux_tail_pt;
+	__u64	aux_offset_pt;
+	__u64	aux_size_pt;
+
+	__u64	aux_head_pebs;
+	__u64	aux_tail_pebs;
+	__u64	aux_offset_pebs;
+	__u64	aux_size_pebs;
 };
 
 #define PERF_RECORD_MISC_CPUMODE_MASK		(7 << 0)

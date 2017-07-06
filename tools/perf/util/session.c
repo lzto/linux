@@ -178,7 +178,8 @@ static void perf_session__delete_threads(struct perf_session *session)
 
 void perf_session__delete(struct perf_session *session)
 {
-	auxtrace__free(session);
+	auxtrace__free_pt(session);
+	auxtrace__free_pebs(session);
 	auxtrace_index__free(&session->auxtrace_index);
 	perf_session__destroy_kernel_maps(session);
 	perf_session__delete_threads(session);
@@ -1299,14 +1300,15 @@ static int perf_session__deliver_event(struct perf_session *session,
 				       struct perf_tool *tool,
 				       u64 file_offset)
 {
+#if 0
 	int ret;
-
+    //FIXME!!!!
 	ret = auxtrace__process_event(session, event, sample, tool);
 	if (ret < 0)
 		return ret;
 	if (ret > 0)
 		return 0;
-
+#endif
 	return machines__deliver_event(&session->machines, session->evlist,
 				       event, sample, tool, file_offset);
 }
@@ -1694,15 +1696,20 @@ done:
 	err = ordered_events__flush(oe, OE_FLUSH__FINAL);
 	if (err)
 		goto out_err;
-	err = auxtrace__flush_events(session, tool);
+	err = auxtrace__flush_events_pt(session, tool);
 	if (err)
 		goto out_err;
+	err = auxtrace__flush_events_pebs(session, tool);
+	if (err)
+		goto out_err;
+
 	err = perf_session__flush_thread_stacks(session);
 out_err:
 	free(buf);
 	perf_session__warn_about_errors(session);
 	ordered_events__free(&session->ordered_events);
-	auxtrace__free_events(session);
+	auxtrace__free_events_pt(session);
+	auxtrace__free_events_pebs(session);
 	return err;
 }
 
@@ -1850,15 +1857,20 @@ out:
 	err = ordered_events__flush(oe, OE_FLUSH__FINAL);
 	if (err)
 		goto out_err;
-	err = auxtrace__flush_events(session, tool);
+	err = auxtrace__flush_events_pt(session, tool);
 	if (err)
 		goto out_err;
+	err = auxtrace__flush_events_pebs(session, tool);
+	if (err)
+		goto out_err;
+
 	err = perf_session__flush_thread_stacks(session);
 out_err:
 	ui_progress__finish();
 	perf_session__warn_about_errors(session);
 	ordered_events__free(&session->ordered_events);
-	auxtrace__free_events(session);
+	auxtrace__free_events_pt(session);
+	auxtrace__free_events_pebs(session);
 	session->one_mmap = false;
 	return err;
 }

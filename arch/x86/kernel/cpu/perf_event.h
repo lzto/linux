@@ -90,7 +90,7 @@ struct amd_nb {
 	(PERF_SAMPLE_IP | PERF_SAMPLE_TID | PERF_SAMPLE_ADDR | \
 	PERF_SAMPLE_ID | PERF_SAMPLE_CPU | PERF_SAMPLE_STREAM_ID | \
 	PERF_SAMPLE_DATA_SRC | PERF_SAMPLE_IDENTIFIER | \
-	PERF_SAMPLE_TRANSACTION)
+	PERF_SAMPLE_REGS_USER | PERF_SAMPLE_TRANSACTION )
 
 /*
  * A debug store configuration.
@@ -194,6 +194,7 @@ struct cpu_hw_events {
 	 */
 	struct debug_store	*ds;
 	u64			pebs_enabled;
+    u64         pebs_aux_enabled;//for aux enabled pebs
 
 	/*
 	 * Intel LBR bits
@@ -616,6 +617,17 @@ struct x86_pmu {
 	 * Intel host/guest support (KVM)
 	 */
 	struct perf_guest_switch_msr *(*guest_get_msrs)(int *nr);
+
+	//copied from pt filter
+	/*
+	 * Validate instruction tracing filters: make sure hw supports the
+	 * requested configuration and number of filters.
+	 *
+	 * Configure instruction tracing filters: translate hw-agnostic filter
+	 * into hardware configuration in event::hw::itrace_filters
+	 */
+	int (*itrace_filter_setup)	(struct perf_event *event); /* optional */
+
 };
 
 struct x86_perf_task_context {
@@ -909,6 +921,8 @@ int intel_pmu_setup_lbr_filter(struct perf_event *event);
 void intel_pt_interrupt(void);
 
 int intel_bts_interrupt(void);
+
+int intel_pebs_interrupt(void);
 
 void intel_bts_enable_local(void);
 

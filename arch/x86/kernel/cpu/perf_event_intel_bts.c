@@ -163,14 +163,14 @@ bts_config_buffer(struct bts_buffer *buf)
 		? ds->bts_buffer_base + thresh
 		: ds->bts_absolute_maximum + BTS_RECORD_SIZE;
 }
-
+#if 0
 static void bts_buffer_pad_out(struct bts_phys *phys, unsigned long head)
 {
 	unsigned long index = head - phys->offset;
 
 	memset(page_address(phys->page) + index, 0, phys->size - index);
 }
-
+#endif
 static bool bts_buffer_is_full(struct bts_buffer *buf, struct bts_ctx *bts)
 {
 	if (buf->snapshot)
@@ -185,6 +185,7 @@ static bool bts_buffer_is_full(struct bts_buffer *buf, struct bts_ctx *bts)
 
 static void bts_update(struct bts_ctx *bts)
 {
+#if 0
 	int cpu = raw_smp_processor_id();
 	struct debug_store *ds = per_cpu(cpu_hw_events, cpu).ds;
 	struct bts_buffer *buf = perf_get_aux(&bts->handle);
@@ -211,10 +212,12 @@ static void bts_update(struct bts_ctx *bts)
 	} else {
 		local_set(&buf->data_size, head);
 	}
+#endif
 }
 
 static void __bts_event_start(struct perf_event *event)
 {
+#if 0
 	struct bts_ctx *bts = this_cpu_ptr(&bts_ctx);
 	struct bts_buffer *buf = perf_get_aux(&bts->handle);
 	u64 config = 0;
@@ -241,6 +244,7 @@ static void __bts_event_start(struct perf_event *event)
 	wmb();
 
 	intel_pmu_enable_bts(config);
+#endif
 }
 
 static void bts_event_start(struct perf_event *event, int flags)
@@ -296,9 +300,11 @@ void intel_bts_disable_local(void)
 		__bts_event_stop(bts->handle.event);
 }
 
+#if 0
 static int
 bts_buffer_reset(struct bts_buffer *buf, struct perf_output_handle *handle)
 {
+
 	unsigned long head, space, next_space, pad, gap, skip, wakeup;
 	unsigned int next_buf;
 	struct bts_phys *phys, *next_phys;
@@ -373,9 +379,11 @@ bts_buffer_reset(struct bts_buffer *buf, struct perf_output_handle *handle)
 
 	return 0;
 }
+#endif
 
 int intel_bts_interrupt(void)
 {
+#if 0
 	struct bts_ctx *bts = this_cpu_ptr(&bts_ctx);
 	struct perf_event *event = bts->handle.event;
 	struct bts_buffer *buf;
@@ -400,7 +408,6 @@ int intel_bts_interrupt(void)
 	/* no new data */
 	if (old_head == local_read(&buf->head))
 		return 0;
-
 	perf_aux_output_end(&bts->handle, local_xchg(&buf->data_size, 0),
 			    !!local_xchg(&buf->lost, 0));
 
@@ -411,18 +418,22 @@ int intel_bts_interrupt(void)
 	err = bts_buffer_reset(buf, &bts->handle);
 	if (err)
 		perf_aux_output_end(&bts->handle, 0, false);
-
+    
 	return 1;
+#else
+    return 1;
+#endif
 }
 
 static void bts_event_del(struct perf_event *event, int mode)
 {
 	struct cpu_hw_events *cpuc = this_cpu_ptr(&cpu_hw_events);
 	struct bts_ctx *bts = this_cpu_ptr(&bts_ctx);
+    #if 0
 	struct bts_buffer *buf = perf_get_aux(&bts->handle);
-
+    #endif
 	bts_event_stop(event, PERF_EF_UPDATE);
-
+    #if 0
 	if (buf) {
 		if (buf->snapshot)
 			bts->handle.head =
@@ -431,7 +442,7 @@ static void bts_event_del(struct perf_event *event, int mode)
 		perf_aux_output_end(&bts->handle, local_xchg(&buf->data_size, 0),
 				    !!local_xchg(&buf->lost, 0));
 	}
-
+    #endif
 	cpuc->ds->bts_index = bts->ds_back.bts_buffer_base;
 	cpuc->ds->bts_buffer_base = bts->ds_back.bts_buffer_base;
 	cpuc->ds->bts_absolute_maximum = bts->ds_back.bts_absolute_maximum;
@@ -440,6 +451,7 @@ static void bts_event_del(struct perf_event *event, int mode)
 
 static int bts_event_add(struct perf_event *event, int mode)
 {
+    #if 0
 	struct bts_buffer *buf;
 	struct bts_ctx *bts = this_cpu_ptr(&bts_ctx);
 	struct cpu_hw_events *cpuc = this_cpu_ptr(&cpu_hw_events);
@@ -453,7 +465,6 @@ static int bts_event_add(struct perf_event *event, int mode)
 
 	if (bts->handle.event)
 		return -EBUSY;
-
 	buf = perf_aux_output_begin(&bts->handle, event);
 	if (!buf)
 		return -EINVAL;
@@ -463,7 +474,6 @@ static int bts_event_add(struct perf_event *event, int mode)
 		perf_aux_output_end(&bts->handle, 0, false);
 		return ret;
 	}
-
 	bts->ds_back.bts_buffer_base = cpuc->ds->bts_buffer_base;
 	bts->ds_back.bts_absolute_maximum = cpuc->ds->bts_absolute_maximum;
 	bts->ds_back.bts_interrupt_threshold = cpuc->ds->bts_interrupt_threshold;
@@ -477,6 +487,9 @@ static int bts_event_add(struct perf_event *event, int mode)
 	}
 
 	return 0;
+    #else
+    return -EBUSY;
+    #endif
 }
 
 static void bts_event_destroy(struct perf_event *event)
