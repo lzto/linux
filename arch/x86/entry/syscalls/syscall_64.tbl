@@ -340,6 +340,7 @@
 331	common	pkey_free		sys_pkey_free
 332	common	statx			sys_statx
 399	64	getpmap			sys_getpmap
+400 64	is_page_clean			sys_is_page_clean
 
 #
 # x32-specific system call numbers start at 512 to avoid cache impact

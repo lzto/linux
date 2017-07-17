@@ -51,7 +51,7 @@ static inline void vm_unacct_memory(long pages)
  */
 static inline bool arch_validate_prot(unsigned long prot)
 {
-	return (prot & ~(PROT_READ | PROT_WRITE | PROT_EXEC | PROT_SEM)) == 0;
+	return (prot & ~(PROT_READ | PROT_WRITE | PROT_EXEC | PROT_SEM | PROT_POPULATE)) == 0;
 }
 #define arch_validate_prot arch_validate_prot
 #endif

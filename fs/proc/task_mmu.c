@@ -1794,7 +1794,7 @@ struct pmap {
 /*
  * process stack and heap info getter accelration
  */
-SYSCALL_DEFINE1(getpmap ,char __user* , mapinfo)
+SYSCALL_DEFINE1(getpmap, char __user*, mapinfo)
 {
     int ret = PMAP_SUCCESS;
     struct vm_area_struct *vma = current->mm->mmap;
@@ -1867,5 +1867,22 @@ SYSCALL_DEFINE1(getpmap ,char __user* , mapinfo)
         return -EFAULT;
     }
     return ret;
+}
+
+SYSCALL_DEFINE1(is_page_clean, char __user*, addr)
+{
+    unsigned int level;
+    pgd_t* pgd = pgd_offset(current->mm, (unsigned long)addr);
+    pte_t* pte = lookup_address_in_pgd(pgd, (unsigned long)addr, &level);
+    /*
+    * MPX bt page should be at least written to in order to be considered
+    * touched, a page that has never been written to should be clean
+    * and don't need special treatment
+    */
+    if (pte && pte_young(*pte) && pte_dirty(*pte))
+    {
+        return 0;
+    }
+    return 1;
 }
 
