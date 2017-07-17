@@ -492,6 +492,10 @@ static int do_mprotect_pkey(unsigned long start, size_t len,
 	}
 out:
 	up_write(&current->mm->mmap_sem);
+    if (prot & PROT_POPULATE)
+    {
+        mm_populate(start, len);
+    }
 	return error;
 }
 
