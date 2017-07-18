@@ -498,11 +498,184 @@ out:
     }
 	return error;
 }
+/*
+ * designated for MPX BT Page
+ */
+int
+mprotect_fixup_mpx(struct vm_area_struct *vma, struct vm_area_struct **pprev,
+	unsigned long start, unsigned long end, unsigned long newflags)
+{
+	struct mm_struct *mm = vma->vm_mm;
+	unsigned long oldflags = vma->vm_flags;
+	long nrpages = 1;
+	unsigned long charged = 0;
+	int error;
+
+	if (newflags == oldflags) {
+		*pprev = vma;
+		return 0;
+	}
+
+	/*
+	 * If we make a private mapping writable we increase our commit;
+	 * but (without finer accounting) cannot reduce our commit if we
+	 * make it unwritable again. hugetlb mapping were accounted for
+	 * even if read-only so there is no need to account for them here
+	 */
+	if (newflags & VM_WRITE) {
+		/* Check space limits when area turns into data. */
+		if (!may_expand_vm(mm, newflags, nrpages) &&
+				may_expand_vm(mm, oldflags, nrpages))
+			return -ENOMEM;
+		if (!(oldflags & (VM_ACCOUNT|VM_WRITE|VM_HUGETLB|
+						VM_SHARED|VM_NORESERVE)))
+        {
+			charged = nrpages;
+			if (security_vm_enough_memory_mm(mm, charged))
+				return -ENOMEM;
+			newflags |= VM_ACCOUNT;
+		}
+	}
+
+	*pprev = vma;
+
+	if (start != vma->vm_start) {
+		error = split_vma(mm, vma, start, 1);
+		if (error)
+			goto fail;
+	}
+
+	if (end != vma->vm_end) {
+		error = split_vma(mm, vma, end, 0);
+		if (error)
+			goto fail;
+	}
+
+	/*
+	 * vm_flags and vm_page_prot are protected by the mmap_sem
+	 * held in write mode.
+	 */
+	vma->vm_flags = newflags;
+	vma_set_page_prot(vma);
+
+    change_protection_range(vma, start, end, vma->vm_page_prot, 0, 0);
+
+	/*
+	 * Private VM_LOCKED VMA becoming writable: trigger COW to avoid major
+	 * fault on access.
+	 */
+	if ((oldflags & (VM_WRITE | VM_SHARED | VM_LOCKED)) == VM_LOCKED &&
+			(newflags & VM_WRITE)) {
+		populate_vma_page_range(vma, start, end, NULL);
+	}
+
+	vm_stat_account(mm, oldflags, -nrpages);
+	vm_stat_account(mm, newflags, nrpages);
+	//perf_event_mmap(vma);
+	return 0;
+
+fail:
+	vm_unacct_memory(charged);
+	return error;
+}
+
+/*
+ * mprotect designated for MPX page, one page per
+ */
+SYSCALL_DEFINE2(mprotect_mpx, unsigned long, start, unsigned long, prot)
+{
+    //FIXME:should check whether this page belongs to MPX region
+	unsigned long nstart, end, tmp;
+	struct vm_area_struct *vma, *prev;
+	int error = -EINVAL;
+	const int grows = prot & (PROT_GROWSDOWN|PROT_GROWSUP);
+
+    //printk("mprotect_mpx:0x%lx,PROT=%d\n", start, prot);
+
+	prot &= ~(PROT_GROWSDOWN|PROT_GROWSUP);
+	if (grows == (PROT_GROWSDOWN|PROT_GROWSUP)) /* can't be both */
+		return -EINVAL;
+
+	if (start & ~PAGE_MASK)
+		return -EINVAL;
+	end = start + PAGE_SIZE;
+	if (end <= start)
+		return -ENOMEM;
+	if (!arch_validate_prot(prot))
+		return -EINVAL;
+
+	if (down_write_killable(&current->mm->mmap_sem))
+		return -EINTR;
+
+	vma = find_vma(current->mm, start);
+	error = -ENOMEM;
+	if (!vma)
+		goto out;
+	prev = vma->vm_prev;
+	if (unlikely(grows & PROT_GROWSDOWN)) {
+		if (vma->vm_start >= end)
+			goto out;
+		start = vma->vm_start;
+		error = -EINVAL;
+		if (!(vma->vm_flags & VM_GROWSDOWN))
+			goto out;
+	} else {
+		if (vma->vm_start > start)
+			goto out;
+		if (unlikely(grows & PROT_GROWSUP)) {
+			end = vma->vm_end;
+			error = -EINVAL;
+			if (!(vma->vm_flags & VM_GROWSUP))
+				goto out;
+		}
+	}
+	if (start > vma->vm_start)
+		prev = vma;
+
+    nstart = start;
+    {
+		unsigned long mask_off_old_flags;
+		unsigned long newflags;
+
+		/* Here we know that vma->vm_start <= nstart < vma->vm_end. */
+
+		/*
+		 * Each mprotect() call explicitly passes r/w/x permissions.
+		 * If a permission is not passed to mprotect(), it must be
+		 * cleared from the VMA.
+		 */
+		mask_off_old_flags = VM_READ | VM_WRITE | VM_EXEC |
+					ARCH_VM_PKEY_FLAGS;
+
+		newflags = calc_vm_prot_bits(prot, 0);
+		newflags |= (vma->vm_flags & ~mask_off_old_flags);
+
+		/* newflags >> 4 shift VM_MAY% in place of VM_% */
+		if ((newflags & ~(newflags >> 4)) & (VM_READ | VM_WRITE | VM_EXEC)) {
+			error = -EACCES;
+			goto out;
+		}
+
+		tmp = vma->vm_end;
+		if (tmp > end)
+			tmp = end;
+		error = mprotect_fixup_mpx(vma, &prev, nstart, tmp, newflags);
+        //printk(" + nstart=%lx, tmp=%lx, newflags=%lx\n", nstart, tmp, newflags);
+	}
+out:
+	up_write(&current->mm->mmap_sem);
+    if (prot & PROT_POPULATE)
+    {
+        mm_populate(start, PAGE_SIZE);
+    }
+    //printk("    error=%d\n", error);
+	return error;
+}
 
 SYSCALL_DEFINE3(mprotect, unsigned long, start, size_t, len,
 		unsigned long, prot)
 {
-	return do_mprotect_pkey(start, len, prot, -1);
+    return do_mprotect_pkey(start, len, prot, -1);
 }
 
 #ifdef CONFIG_ARCH_HAS_PKEYS
