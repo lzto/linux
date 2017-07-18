@@ -341,6 +341,7 @@
 332	common	statx			sys_statx
 399	64	getpmap			sys_getpmap
 400 64	is_page_clean			sys_is_page_clean
+401 64  mprotect_mpx    sys_mprotect_mpx
 
 #
 # x32-specific system call numbers start at 512 to avoid cache impact
