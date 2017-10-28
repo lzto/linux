@@ -69,22 +69,6 @@
 		ranges = <MBUS_ID(0xf0, 0x01) 0 0xd0000000 0x100000
 			  MBUS_ID(0x01, 0xe0) 0 0xfff00000 0x100000>;
 
-		pcie-controller {
-			status = "okay";
-
-			/* Connected to Renesas uPD720202 USB 3.0 Host */
-			pcie@1,0 {
-				/* Port 0, Lane 0 */
-				status = "okay";
-			};
-
-			/* unpopulated miniPCIe slot */
-			pcie@2,0 {
-				/* Port 1, Lane 0 */
-				status = "disabled";
-			};
-		};
-
 		internal-regs {
 			rtc@10300 {
 				status = "disabled";
@@ -374,5 +358,21 @@
             label = "u-boot-env";
         };
     };
+};
+
+&pciec {
+	status = "okay";
+
+    /* Connected to Renesas uPD720202 USB 3.0 Host */
+	pcie@1,0 {
+		/* Port 0, Lane 0 */
+		status = "okay";
+	};
+
+    /* unpopulated miniPCIe slot */
+	pcie@2,0 {
+		/* Port 1, Lane 0 */
+		status = "disabled";
+	};
 };
 
