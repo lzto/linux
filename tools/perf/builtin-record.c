@@ -37,13 +37,13 @@
 #include <sched.h>
 #include <sys/mman.h>
 
-
 struct record {
 	struct perf_tool	tool;
 	struct record_opts	opts;
 	u64			bytes_written;
 	struct perf_data_file	file;
-	struct auxtrace_record	*itr;
+	struct auxtrace_record	*itr_pt;
+	struct auxtrace_record	*itr_pebs;
 	struct perf_evlist	*evlist;
 	struct perf_session	*session;
 	const char		*progname;
@@ -182,22 +182,41 @@ static int record__process_auxtrace(struct perf_tool *tool,
 	return 0;
 }
 
-static int record__auxtrace_mmap_read(struct record *rec,
+static int record__auxtrace_mmap_read_pt(struct record *rec,
 				      struct auxtrace_mmap *mm)
 {
 	int ret;
+    //read into/from different record
+    if (rec->itr_pt!=NULL)
+    {
+        ret = auxtrace_mmap__read_pt(mm, rec->itr_pt, &rec->tool,
+                      record__process_auxtrace);
+        if (ret < 0)
+            return ret;
 
-	ret = auxtrace_mmap__read(mm, rec->itr, &rec->tool,
-				  record__process_auxtrace);
-	if (ret < 0)
-		return ret;
+        if (ret)
+            rec->samples++;
+    }
+    return 0;
+}
+static int record__auxtrace_mmap_read_pebs(struct record*rec,
+                    struct auxtrace_mmap*mm)
+{
+    int ret;
+    if (rec->itr_pebs!=NULL)
+    {
+        ret = auxtrace_mmap__read_pebs(mm, rec->itr_pebs, &rec->tool,
+                      record__process_auxtrace);
+        if (ret < 0)
+            return ret;
 
-	if (ret)
-		rec->samples++;
-
+        if (ret)
+            rec->samples++;
+    }
 	return 0;
 }
 
+#if 0//FIXME
 static int record__auxtrace_mmap_read_snapshot(struct record *rec,
 					       struct auxtrace_mmap *mm)
 {
@@ -235,8 +254,7 @@ static int record__auxtrace_read_snapshot_all(struct record *rec)
 out:
 	return rc;
 }
-
-static void record__read_auxtrace_snapshot(struct record *rec)
+static void record__read_auxtrace_snapshot(struct record *rec __maybe_unused)
 {
 	pr_debug("Recording AUX area tracing snapshot\n");
 	if (record__auxtrace_read_snapshot_all(rec) < 0) {
@@ -246,7 +264,9 @@ static void record__read_auxtrace_snapshot(struct record *rec)
 		if (!auxtrace_snapshot_err)
 			auxtrace_snapshot_enabled = 1;
 	}
+
 }
+#endif
 
 #else
 
@@ -278,6 +298,8 @@ static int record__open(struct record *rec)
 	struct perf_session *session = rec->session;
 	struct record_opts *opts = &rec->opts;
 	int rc = 0;
+    pr_debug("record__open: auxtrace_mmap_pages=%d\n",
+            opts->auxtrace_mmap_pages);
 
 	perf_evlist__config(evlist, opts);
 
@@ -344,6 +366,14 @@ static int process_sample_event(struct perf_tool *tool,
 	return build_id__mark_dso_hit(tool, event, sample, evsel, machine);
 }
 
+//#define ONLINE_EVENT_SORTING
+
+#ifdef ONLINE_EVENT_SORTING
+inline static int process_buildids(__maybe_unused struct record *rec)
+{
+	return 0;
+}
+#else
 static int process_buildids(struct record *rec)
 {
 	struct perf_data_file *file  = &rec->file;
@@ -372,6 +402,7 @@ static int process_buildids(struct record *rec)
 
 	return perf_session__process_events(session);
 }
+#endif
 
 static void perf_event__synthesize_guest_os(struct machine *machine, void *data)
 {
@@ -407,27 +438,40 @@ static struct perf_event_header finished_round_event = {
 	.type = PERF_RECORD_FINISHED_ROUND,
 };
 
+//read out all aux data
 static int record__mmap_read_all(struct record *rec)
 {
 	u64 bytes_written = rec->bytes_written;
 	int i;
 	int rc = 0;
-
+    pr_debug("record__mmap_read_all: %d maps\n", rec->evlist->nr_mmaps);
 	for (i = 0; i < rec->evlist->nr_mmaps; i++) {
-		struct auxtrace_mmap *mm = &rec->evlist->mmap[i].auxtrace_mmap;
+		struct auxtrace_mmap *mm_pt = &rec->evlist->mmap[i].auxtrace_mmap_pt;
+		struct auxtrace_mmap *mm_pebs = &rec->evlist->mmap[i].auxtrace_mmap_pebs;
 
+        pr_debug("map %d:\n", i);
 		if (rec->evlist->mmap[i].base) {
 			if (record__mmap_read(rec, i) != 0) {
 				rc = -1;
 				goto out;
 			}
 		}
-
-		if (mm->base && !rec->opts.auxtrace_snapshot_mode &&
-		    record__auxtrace_mmap_read(rec, mm) != 0) {
-			rc = -1;
-			goto out;
-		}
+        if (rec->itr_pt)
+        {
+            if (mm_pt->base && !rec->opts.auxtrace_snapshot_mode &&
+                record__auxtrace_mmap_read_pt(rec, mm_pt) != 0) {
+                rc = -1;
+                goto out;
+            }
+        }
+        if (rec->itr_pebs)
+        {
+            if (mm_pebs->base && !rec->opts.auxtrace_snapshot_mode &&
+                record__auxtrace_mmap_read_pebs(rec, mm_pebs) != 0) {
+                rc = -1;
+                goto out;
+            }
+        }
 	}
 
 	/*
@@ -475,6 +519,7 @@ static void workload_exec_failed_signal(int signo __maybe_unused,
 					siginfo_t *info,
 					void *ucontext __maybe_unused)
 {
+    pr_debug("workload_exec_failed_signal!!!\n");
 	workload_exec_errno = info->si_value.sival_int;
 	done = 1;
 	child_finished = 1;
@@ -533,7 +578,7 @@ static int __cmd_record(struct record *rec, int argc, const char **argv)
 		err = -1;
 		goto out_child;
 	}
-
+    pr_debug("__cmd_record: opened record\n");
 	/*
 	 * Normally perf_session__new would do this, but it doesn't have the
 	 * evlist.
@@ -593,11 +638,24 @@ static int __cmd_record(struct record *rec, int argc, const char **argv)
 		}
 	}
 
-	if (rec->opts.full_auxtrace) {
-		err = perf_event__synthesize_auxtrace_info(rec->itr, tool,
-					session, process_synthesized_event);
-		if (err)
-			goto out_delete_session;
+	if (rec->opts.full_auxtrace)
+    {
+        if (rec->itr_pt)
+        {
+            pr_debug("perf_event__synthesize_auxtrace_info : pt\n");
+            err = perf_event__synthesize_auxtrace_info(rec->itr_pt, tool,
+                        session, process_synthesized_event);
+            if (err)
+                goto out_delete_session;
+         }
+         if (rec->itr_pebs)
+         {
+            pr_debug("perf_event__synthesize_auxtrace_info : pebs\n");
+            err = perf_event__synthesize_auxtrace_info(rec->itr_pebs, tool,
+                        session, process_synthesized_event);
+            if (err)
+                goto out_delete_session;
+         }
 	}
 
 	err = perf_event__synthesize_kernel_mmap(tool, process_synthesized_event,
@@ -668,6 +726,7 @@ static int __cmd_record(struct record *rec, int argc, const char **argv)
 					    machine);
 		free(event);
 
+        pr_debug(" calling -> perf_evlist__start_workload\n");
 		perf_evlist__start_workload(rec->evlist);
 	}
 
@@ -675,8 +734,8 @@ static int __cmd_record(struct record *rec, int argc, const char **argv)
 		usleep(opts->initial_delay * 1000);
 		perf_evlist__enable(rec->evlist);
 	}
-
-	auxtrace_snapshot_enabled = 1;
+    pr_debug("pulling perf info - begin\n");
+	auxtrace_snapshot_enabled = 0;
 	for (;;) {
 		unsigned long long hits = rec->samples;
 
@@ -685,7 +744,7 @@ static int __cmd_record(struct record *rec, int argc, const char **argv)
 			err = -1;
 			goto out_child;
 		}
-
+#if 0
 		if (auxtrace_record__snapshot_started) {
 			auxtrace_record__snapshot_started = 0;
 			if (!auxtrace_snapshot_err)
@@ -696,7 +755,7 @@ static int __cmd_record(struct record *rec, int argc, const char **argv)
 				goto out_child;
 			}
 		}
-
+#endif
 		if (hits == rec->samples) {
 			if (done || draining)
 				break;
@@ -725,6 +784,7 @@ static int __cmd_record(struct record *rec, int argc, const char **argv)
 		}
 	}
 	auxtrace_snapshot_enabled = 0;
+    pr_debug("pulling perf info - end\n");
 
 	if (forks && workload_exec_errno) {
 		char msg[STRERR_BUFSIZE];
@@ -763,6 +823,7 @@ out_child:
 		file->size = lseek(perf_data_file__fd(file), 0, SEEK_CUR);
 
 		if (!rec->no_buildid) {
+			//FIXME! defer this process!!!
 			process_buildids(rec);
 
 			if (rec->buildid_all)
@@ -1022,6 +1083,7 @@ static struct record record = {
 			.default_per_cpu = true,
 		},
 		.proc_map_timeout     = 500,
+        .auxtrace_mmap_pages = 128,//default auxtrace_mmap_pages is 128
 	},
 	.tool = {
 		.sample		= process_sample_event,
@@ -1125,6 +1187,9 @@ struct option __record_options[] = {
 	OPT_CALLBACK_OPTARG('I', "intr-regs", &record.opts.sample_intr_regs, NULL, "any register",
 		    "sample selected machine registers on interrupt,"
 		    " use -I ? to list register names", parse_regs),
+	OPT_CALLBACK_OPTARG('U', "user-regs", &record.opts.sample_user_regs, NULL, "any register",
+			"sample selected user registers,"
+		    " use -U ? to list register names", parse_regs),
 	OPT_BOOLEAN(0, "running-time", &record.opts.running_time,
 		    "Record running/enabled time of read (:S) events"),
 	OPT_CALLBACK('k', "clockid", &record.opts,
@@ -1198,18 +1263,25 @@ int cmd_record(int argc, const char **argv, const char *prefix __maybe_unused)
 		parse_options_usage(record_usage, record_options, "switch-events", 0);
 		return -EINVAL;
 	}
-
-	if (!rec->itr) {
-		rec->itr = auxtrace_record__init(rec->evlist, &err);
-		if (err)
-			return err;
-	}
-
+    if (!rec->itr_pt)
+    {
+        rec->itr_pt = auxtrace_record__init_pt(rec->evlist,&err);
+        if (err)
+            return err;
+    }
+    if (!rec->itr_pebs)
+    {
+        rec->itr_pebs = auxtrace_record__init_pebs(rec->evlist,&err);
+        if (err)
+            return err;
+    }
+    //FIXME, snapshot
+    #if 0
 	err = auxtrace_parse_snapshot_options(rec->itr, &rec->opts,
 					      rec->opts.auxtrace_snapshot_opts);
 	if (err)
 		return err;
-
+    #endif
 	err = -ENOMEM;
 
 	symbol__init(NULL);
@@ -1256,11 +1328,23 @@ int cmd_record(int argc, const char **argv, const char *prefix __maybe_unused)
 	err = -ENOMEM;
 	if (perf_evlist__create_maps(rec->evlist, &rec->opts.target) < 0)
 		usage_with_options(record_usage, record_options);
-
-	err = auxtrace_record__options(rec->itr, rec->evlist, &rec->opts);
+    
+	err = auxtrace_record__options(rec->itr_pebs, rec->evlist, &rec->opts);
 	if (err)
 		goto out_symbol_exit;
 
+	err = auxtrace_record__options(rec->itr_pt, rec->evlist, &rec->opts);
+	if (err)
+		goto out_symbol_exit;
+    if (!(rec->itr_pebs || rec->itr_pt))
+    {
+        pr_debug("no aux data needed\n");
+        rec->opts.auxtrace_mmap_pages = 0;
+    }else
+    {
+        rec->opts.auxtrace_mmap_pages = 128;
+        rec->opts.mmap_pages = 128;
+    }
 	/*
 	 * We take all buildids when the file contains
 	 * AUX area tracing data because we do not decode the
@@ -1278,7 +1362,8 @@ int cmd_record(int argc, const char **argv, const char *prefix __maybe_unused)
 out_symbol_exit:
 	perf_evlist__delete(rec->evlist);
 	symbol__exit();
-	auxtrace_record__free(rec->itr);
+	auxtrace_record__free(rec->itr_pt);
+	auxtrace_record__free(rec->itr_pebs);
 	return err;
 }
 
@@ -1286,7 +1371,11 @@ static void snapshot_sig_handler(int sig __maybe_unused)
 {
 	if (!auxtrace_snapshot_enabled)
 		return;
+#if 0
 	auxtrace_snapshot_enabled = 0;
-	auxtrace_snapshot_err = auxtrace_record__snapshot_start(record.itr);
+	auxtrace_snapshot_err = auxtrace_record__snapshot_start(record.itr_pt);
+	auxtrace_snapshot_err = auxtrace_record__snapshot_start(record.itr_pebs);
 	auxtrace_record__snapshot_started = 1;
+#endif
 }
+

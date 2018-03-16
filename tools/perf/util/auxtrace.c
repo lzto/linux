@@ -49,42 +49,89 @@
 
 #include "intel-pt.h"
 #include "intel-bts.h"
+#include "intel-pebs.h"
 
-int auxtrace_mmap__mmap(struct auxtrace_mmap *mm,
-			struct auxtrace_mmap_params *mp,
+int auxtrace_mmap__mmap(struct auxtrace_mmap *mm_pt,
+            struct auxtrace_mmap *mm_pebs,
+			struct auxtrace_mmap_params *mp_pt,
+			struct auxtrace_mmap_params *mp_pebs,
 			void *userpg, int fd)
 {
 	struct perf_event_mmap_page *pc = userpg;
 
-	WARN_ONCE(mm->base, "Uninitialized auxtrace_mmap\n");
+    size_t offset;
+    size_t len;
 
-	mm->userpg = userpg;
-	mm->mask = mp->mask;
-	mm->len = mp->len;
-	mm->prev = 0;
-	mm->idx = mp->idx;
-	mm->tid = mp->tid;
-	mm->cpu = mp->cpu;
+	WARN_ONCE(mm_pt->base, "Uninitialized auxtrace_mmap\n");
+	WARN_ONCE(mm_pebs->base, "Uninitialized auxtrace_mmap\n");
 
-	if (!mp->len) {
-		mm->base = NULL;
-		return 0;
-	}
+	mm_pt->userpg = userpg;
+	mm_pt->mask = mp_pt->mask;
+	mm_pt->len = mp_pt->len;
+	mm_pt->prev = 0;
+	mm_pt->idx = mp_pt->idx;
+	mm_pt->tid = mp_pt->tid;
+	mm_pt->cpu = mp_pt->cpu;
+
+	mm_pebs->userpg = userpg;
+	mm_pebs->mask = mp_pebs->mask;
+	mm_pebs->len = mp_pebs->len;
+	mm_pebs->prev = 0;
+	mm_pebs->idx = mp_pebs->idx;
+	mm_pebs->tid = mp_pebs->tid;
+	mm_pebs->cpu = mp_pebs->cpu;
 
 #if BITS_PER_LONG != 64 && !defined(HAVE_SYNC_COMPARE_AND_SWAP_SUPPORT)
 	pr_err("Cannot use AUX area tracing mmaps\n");
 	return -1;
 #endif
 
-	pc->aux_offset = mp->offset;
-	pc->aux_size = mp->len;
+    //must set this
+	pc->aux_offset_pt = mp_pt->offset;
+	pc->aux_size_pt = mp_pt->len;
+	pc->aux_offset_pebs = mp_pebs->offset;
+	pc->aux_size_pebs = mp_pebs->len;
 
-	mm->base = mmap(NULL, mp->len, mp->prot, MAP_SHARED, fd, mp->offset);
-	if (mm->base == MAP_FAILED) {
-		pr_debug2("failed to mmap AUX area\n");
-		mm->base = NULL;
+    if ((mp_pt->len + mp_pebs->len)==0)
+    {
+        pr_debug("no aux data needed\n");
+        return 0;
+    }
+
+    pr_debug("aux setup:pt[%llu+%llu] pebs[%llu+%llu]\n",
+        pc->aux_offset_pt, pc->aux_size_pt,
+        pc->aux_offset_pebs, pc->aux_size_pebs);
+    
+    offset = mp_pt->offset<mp_pebs->offset?mp_pt->offset:mp_pebs->offset;
+    len = mp_pt->len + mp_pebs->len;
+
+    pr_debug(" mmap [%lu+%lu]\n", offset, len);
+
+	mm_pt->base = mmap(NULL,
+                    len,
+                    mp_pt->prot,
+                    MAP_SHARED,
+                    fd,
+                    offset);
+	mm_pebs->base = mm_pt->base + mp_pt->len;
+
+    if (mm_pt->base == MAP_FAILED) {
+		pr_debug("failed to mmap AUX area\n");
+		mm_pt->base = NULL;
+        mm_pebs->base = NULL;
 		return -1;
 	}
+
+    if (mp_pt->len==0)
+    {
+        mm_pt->base = NULL;
+    }
+    if (mp_pebs->len==0)
+    {
+        mm_pebs->base = NULL;
+    }
+
+    pr_debug("mmap aux pt:%p pebs:%p\n", mm_pt->base, mm_pebs->base);
 
 	return 0;
 }
@@ -216,7 +263,7 @@ static void *auxtrace_copy_data(u64 size, struct perf_session *session)
 
 	return p;
 }
-
+//only add matching pmu type trace only!
 static int auxtrace_queues__add_buffer(struct auxtrace_queues *queues,
 				       unsigned int idx,
 				       struct auxtrace_buffer *buffer)
@@ -891,6 +938,8 @@ int perf_event__process_auxtrace_info(struct perf_tool *tool __maybe_unused,
 		return intel_pt_process_auxtrace_info(event, session);
 	case PERF_AUXTRACE_INTEL_BTS:
 		return intel_bts_process_auxtrace_info(event, session);
+	case PERF_AUXTRACE_INTEL_PEBS:
+		return intel_pebs_process_auxtrace_info(event, session);
 	case PERF_AUXTRACE_UNKNOWN:
 	default:
 		return -EINVAL;
@@ -912,10 +961,39 @@ s64 perf_event__process_auxtrace(struct perf_tool *tool,
 	if (auxtrace__dont_decode(session))
 		return event->auxtrace.size;
 
-	if (!session->auxtrace || event->header.type != PERF_RECORD_AUXTRACE)
+	if (event->header.type != PERF_RECORD_AUXTRACE)
 		return -EINVAL;
 
-	err = session->auxtrace->process_auxtrace_event(session, event, tool);
+    err = -EINVAL;
+    switch(((struct auxtrace_event*)event)->pmu)
+    {
+        case(PERF_AUXTRACE_INTEL_PT):
+        {
+            if (!session->auxtrace_pt)
+            {
+                break;
+            }
+	        err = session->auxtrace_pt->process_auxtrace_event(session, event, tool);
+            break;
+        }
+        case(PERF_AUXTRACE_INTEL_PEBS):
+        {
+            if (!session->auxtrace_pebs)
+            {
+                break;
+            }
+	        err = session->auxtrace_pebs->process_auxtrace_event(session, event, tool);
+            break;
+        }
+        case(PERF_AUXTRACE_INTEL_BTS):
+        {
+            break;
+        }
+        default:
+        {
+            err = -EINVAL;
+        }
+    }
 	if (err < 0)
 		return err;
 
@@ -1146,7 +1224,7 @@ int perf_event__process_auxtrace_error(struct perf_tool *tool __maybe_unused,
 	return 0;
 }
 
-static int __auxtrace_mmap__read(struct auxtrace_mmap *mm,
+static int __auxtrace_mmap__read_pt(struct auxtrace_mmap *mm,
 				 struct auxtrace_record *itr,
 				 struct perf_tool *tool, process_auxtrace_t fn,
 				 bool snapshot, size_t snapshot_size)
@@ -1158,18 +1236,22 @@ static int __auxtrace_mmap__read(struct auxtrace_mmap *mm,
 	void *data1, *data2;
 
 	if (snapshot) {
+        #if 0
 		head = auxtrace_mmap__read_snapshot_head(mm);
 		if (auxtrace_record__find_snapshot(itr, mm->idx, mm, data,
 						   &head, &old))
+        #else
+        //FIXME: dont support snapshot
 			return -1;
+        #endif
 	} else {
-		head = auxtrace_mmap__read_head(mm);
+		head = auxtrace_mmap__read_head_pt(mm);
 	}
-
+    //pr_debug("rbchk pt old=%lu,head=%lu\n", old, head);
 	if (old == head)
 		return 0;
 
-	pr_debug3("auxtrace idx %d old %#"PRIx64" head %#"PRIx64" diff %#"PRIx64"\n",
+	pr_debug("    pt auxtrace idx %d old %#"PRIx64" head %#"PRIx64" diff %#"PRIx64"\n",
 		  mm->idx, old, head, head - old);
 
 	if (mm->mask) {
@@ -1236,6 +1318,7 @@ static int __auxtrace_mmap__read(struct auxtrace_mmap *mm,
 	ev.auxtrace.idx = mm->idx;
 	ev.auxtrace.tid = mm->tid;
 	ev.auxtrace.cpu = mm->cpu;
+    ev.auxtrace.pmu = PERF_AUXTRACE_INTEL_PT;
 
 	if (fn(tool, &ev, data1, len1, data2, len2))
 		return -1;
@@ -1243,7 +1326,7 @@ static int __auxtrace_mmap__read(struct auxtrace_mmap *mm,
 	mm->prev = head;
 
 	if (!snapshot) {
-		auxtrace_mmap__write_tail(mm, head);
+		auxtrace_mmap__write_tail_pt(mm, head);
 		if (itr->read_finish) {
 			int err;
 
@@ -1256,12 +1339,135 @@ static int __auxtrace_mmap__read(struct auxtrace_mmap *mm,
 	return 1;
 }
 
-int auxtrace_mmap__read(struct auxtrace_mmap *mm, struct auxtrace_record *itr,
-			struct perf_tool *tool, process_auxtrace_t fn)
+static int __auxtrace_mmap__read_pebs(struct auxtrace_mmap *mm,
+				 struct auxtrace_record *itr,
+				 struct perf_tool *tool, process_auxtrace_t fn,
+				 bool snapshot, size_t snapshot_size)
 {
-	return __auxtrace_mmap__read(mm, itr, tool, fn, false, 0);
+	u64 head, old = mm->prev, offset, ref;
+	unsigned char *data = mm->base;
+	size_t size, head_off, old_off, len1, len2, padding;
+	union perf_event ev;
+	void *data1, *data2;
+
+	if (snapshot) {
+        #if 0
+		head = auxtrace_mmap__read_snapshot_head(mm);
+		if (auxtrace_record__find_snapshot(itr, mm->idx, mm, data,
+						   &head, &old))
+        #else
+        //FIXME: dont support snapshot
+			return -1;
+        #endif
+	} else {
+		head = auxtrace_mmap__read_head_pebs(mm);
+	}
+    //pr_debug("rbchk pebs old=%lu,head=%lu\n", old, head);
+	if (old == head)
+		return 0;
+
+	pr_debug("    pebs auxtrace idx %d old %#"PRIx64" head %#"PRIx64" diff %#"PRIx64"\n",
+		  mm->idx, old, head, head - old);
+
+	if (mm->mask) {
+		head_off = head & mm->mask;
+		old_off = old & mm->mask;
+	} else {
+		head_off = head % mm->len;
+		old_off = old % mm->len;
+	}
+
+	if (head_off > old_off)
+		size = head_off - old_off;
+	else
+		size = mm->len - (old_off - head_off);
+
+	if (snapshot && size > snapshot_size)
+		size = snapshot_size;
+
+	ref = auxtrace_record__reference(itr);
+
+	if (head > old || size <= head || mm->mask) {
+		offset = head - size;
+	} else {
+		/*
+		 * When the buffer size is not a power of 2, 'head' wraps at the
+		 * highest multiple of the buffer size, so we have to subtract
+		 * the remainder here.
+		 */
+		u64 rem = (0ULL - mm->len) % mm->len;
+
+		offset = head - size - rem;
+	}
+
+	if (size > head_off) {
+		len1 = size - head_off;
+		data1 = &data[mm->len - len1];
+		len2 = head_off;
+		data2 = &data[0];
+	} else {
+		len1 = size;
+		data1 = &data[head_off - len1];
+		len2 = 0;
+		data2 = NULL;
+	}
+
+	if (itr->alignment) {
+		unsigned int unwanted = len1 % itr->alignment;
+
+		len1 -= unwanted;
+		size -= unwanted;
+	}
+
+	/* padding must be written by fn() e.g. record__process_auxtrace() */
+	padding = size & 7;
+	if (padding)
+		padding = 8 - padding;
+
+	memset(&ev, 0, sizeof(ev));
+	ev.auxtrace.header.type = PERF_RECORD_AUXTRACE;
+	ev.auxtrace.header.size = sizeof(ev.auxtrace);
+	ev.auxtrace.size = size + padding;
+	ev.auxtrace.offset = offset;
+	ev.auxtrace.reference = ref;
+	ev.auxtrace.idx = mm->idx;
+	ev.auxtrace.tid = mm->tid;
+	ev.auxtrace.cpu = mm->cpu;
+    ev.auxtrace.pmu = PERF_AUXTRACE_INTEL_PEBS;
+
+	if (fn(tool, &ev, data1, len1, data2, len2))
+		return -1;
+
+	mm->prev = head;
+
+	if (!snapshot) {
+		auxtrace_mmap__write_tail_pebs(mm, head);
+		if (itr->read_finish) {
+			int err;
+
+			err = itr->read_finish(itr, mm->idx);
+			if (err < 0)
+				return err;
+		}
+	}
+
+	return 1;
 }
 
+
+int auxtrace_mmap__read_pt(struct auxtrace_mmap *mm, struct auxtrace_record *itr,
+			struct perf_tool *tool, process_auxtrace_t fn)
+{
+	return __auxtrace_mmap__read_pt(mm, itr, tool, fn, false, 0);
+}
+
+int auxtrace_mmap__read_pebs(struct auxtrace_mmap *mm, struct auxtrace_record *itr,
+			struct perf_tool *tool, process_auxtrace_t fn)
+{
+	return __auxtrace_mmap__read_pebs(mm, itr, tool, fn, false, 0);
+}
+
+#if 0
 int auxtrace_mmap__read_snapshot(struct auxtrace_mmap *mm,
 				 struct auxtrace_record *itr,
 				 struct perf_tool *tool, process_auxtrace_t fn,
@@ -1269,6 +1475,7 @@ int auxtrace_mmap__read_snapshot(struct auxtrace_mmap *mm,
 {
 	return __auxtrace_mmap__read(mm, itr, tool, fn, true, snapshot_size);
 }
+#endif
 
 /**
  * struct auxtrace_cache - hash table to implement a cache

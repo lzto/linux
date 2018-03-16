@@ -502,7 +502,7 @@ static int intel_pt_recording_options(struct auxtrace_record *itr,
 	bool have_timing_info;
 	struct perf_evsel *evsel, *intel_pt_evsel = NULL;
 	const struct cpu_map *cpus = evlist->cpus;
-	bool privileged = geteuid() == 0 || perf_event_paranoid() < 0;
+	//bool privileged = geteuid() == 0 || perf_event_paranoid() < 0;
 	u64 tsc_bit;
 	int err;
 
@@ -539,6 +539,7 @@ static int intel_pt_recording_options(struct auxtrace_record *itr,
 	if (err)
 		return err;
 
+    #if 0
 	/* Set default sizes for snapshot mode */
 	if (opts->auxtrace_snapshot_mode) {
 		size_t psb_period = intel_pt_psb_period(intel_pt_pmu, evlist);
@@ -583,7 +584,8 @@ static int intel_pt_recording_options(struct auxtrace_record *itr,
 			ui__warning("Intel PT snapshot size (%zu) may be too small for PSB period (%zu)\n",
 				    opts->auxtrace_snapshot_size, psb_period);
 	}
-
+    #endif
+    #if 0
 	/* Set default sizes for full trace mode */
 	if (opts->full_auxtrace && !opts->auxtrace_mmap_pages) {
 		if (privileged) {
@@ -594,6 +596,7 @@ static int intel_pt_recording_options(struct auxtrace_record *itr,
 				opts->mmap_pages = KiB(256) / page_size;
 		}
 	}
+    #endif
 
 	/* Validate auxtrace_mmap_pages */
 	if (opts->auxtrace_mmap_pages) {

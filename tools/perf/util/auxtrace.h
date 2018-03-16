@@ -41,6 +41,7 @@ enum auxtrace_type {
 	PERF_AUXTRACE_UNKNOWN,
 	PERF_AUXTRACE_INTEL_PT,
 	PERF_AUXTRACE_INTEL_BTS,
+	PERF_AUXTRACE_INTEL_PEBS,
 };
 
 enum itrace_period_type {
@@ -207,6 +208,7 @@ struct auxtrace_queues {
 	bool			new_data;
 	bool			populated;
 	u64			next_buffer_nr;
+    //u32         pmu;//what kind of queue is this
 };
 
 /**
@@ -320,23 +322,32 @@ struct auxtrace_record {
  * the buffer is not updated while the snapshot is made (e.g. Intel PT disables
  * the event) so there is not a race anyway.
  */
-static inline u64 auxtrace_mmap__read_snapshot_head(struct auxtrace_mmap *mm)
+static inline u64 auxtrace_mmap__read_snapshot_head_pt(struct auxtrace_mmap *mm)
 {
 	struct perf_event_mmap_page *pc = mm->userpg;
-	u64 head = ACCESS_ONCE(pc->aux_head);
+	u64 head = ACCESS_ONCE(pc->aux_head_pt);
+
+	/* Ensure all reads are done after we read the head */
+	rmb();
+	return head;
+}
+static inline u64 auxtrace_mmap__read_snapshot_head_pebs(struct auxtrace_mmap *mm)
+{
+	struct perf_event_mmap_page *pc = mm->userpg;
+	u64 head = ACCESS_ONCE(pc->aux_head_pebs);
 
 	/* Ensure all reads are done after we read the head */
 	rmb();
 	return head;
 }
 
-static inline u64 auxtrace_mmap__read_head(struct auxtrace_mmap *mm)
+static inline u64 auxtrace_mmap__read_head_pt(struct auxtrace_mmap *mm)
 {
 	struct perf_event_mmap_page *pc = mm->userpg;
 #if BITS_PER_LONG == 64 || !defined(HAVE_SYNC_COMPARE_AND_SWAP_SUPPORT)
-	u64 head = ACCESS_ONCE(pc->aux_head);
+	u64 head = ACCESS_ONCE(pc->aux_head_pt);
 #else
-	u64 head = __sync_val_compare_and_swap(&pc->aux_head, 0, 0);
+	u64 head = __sync_val_compare_and_swap(&pc->aux_head_pt, 0, 0);
 #endif
 
 	/* Ensure all reads are done after we read the head */
@@ -344,27 +355,62 @@ static inline u64 auxtrace_mmap__read_head(struct auxtrace_mmap *mm)
 	return head;
 }
 
-static inline void auxtrace_mmap__write_tail(struct auxtrace_mmap *mm, u64 tail)
+static inline u64 auxtrace_mmap__read_head_pebs(struct auxtrace_mmap *mm)
+{
+	struct perf_event_mmap_page *pc = mm->userpg;
+#if BITS_PER_LONG == 64 || !defined(HAVE_SYNC_COMPARE_AND_SWAP_SUPPORT)
+	u64 head = ACCESS_ONCE(pc->aux_head_pebs);
+#else
+	u64 head = __sync_val_compare_and_swap(&pc->aux_head_pebs, 0, 0);
+#endif
+
+	/* Ensure all reads are done after we read the head */
+	rmb();
+	return head;
+}
+
+static inline void auxtrace_mmap__write_tail_pt(struct auxtrace_mmap *mm, u64 tail_pt)
 {
 	struct perf_event_mmap_page *pc = mm->userpg;
 #if BITS_PER_LONG != 64 && defined(HAVE_SYNC_COMPARE_AND_SWAP_SUPPORT)
-	u64 old_tail;
+	u64 old_tail_pt;
 #endif
 
 	/* Ensure all reads are done before we write the tail out */
 	mb();
 #if BITS_PER_LONG == 64 || !defined(HAVE_SYNC_COMPARE_AND_SWAP_SUPPORT)
-	pc->aux_tail = tail;
+	pc->aux_tail_pt = tail_pt;
 #else
 	do {
-		old_tail = __sync_val_compare_and_swap(&pc->aux_tail, 0, 0);
-	} while (!__sync_bool_compare_and_swap(&pc->aux_tail, old_tail, tail));
+		old_tail_pt = __sync_val_compare_and_swap(&pc->aux_tail_pt, 0, 0);
+	} while (!__sync_bool_compare_and_swap(&pc->aux_tail_pt, old_tail_pt, tail_pt));
 #endif
 }
 
-int auxtrace_mmap__mmap(struct auxtrace_mmap *mm,
-			struct auxtrace_mmap_params *mp,
+static inline void auxtrace_mmap__write_tail_pebs(struct auxtrace_mmap *mm, u64 tail_pebs)
+{
+	struct perf_event_mmap_page *pc = mm->userpg;
+#if BITS_PER_LONG != 64 && defined(HAVE_SYNC_COMPARE_AND_SWAP_SUPPORT)
+	u64 old_tail_pebs;
+#endif
+
+	/* Ensure all reads are done before we write the tail out */
+	mb();
+#if BITS_PER_LONG == 64 || !defined(HAVE_SYNC_COMPARE_AND_SWAP_SUPPORT)
+	pc->aux_tail_pebs = tail_pebs;
+#else
+	do {
+		old_tail_pebs = __sync_val_compare_and_swap(&pc->aux_tail_pebs, 0, 0);
+	} while (!__sync_bool_compare_and_swap(&pc->aux_tail_pebs, old_tail_pebs, tail_pebs));
+#endif
+}
+
+int auxtrace_mmap__mmap(struct auxtrace_mmap *mm_pt,
+            struct auxtrace_mmap *mm_pebs,
+			struct auxtrace_mmap_params *mp_pt,
+			struct auxtrace_mmap_params *mp_pebs,
 			void *userpg, int fd);
+
 void auxtrace_mmap__munmap(struct auxtrace_mmap *mm);
 void auxtrace_mmap_params__init(struct auxtrace_mmap_params *mp,
 				off_t auxtrace_offset,
@@ -378,7 +424,9 @@ typedef int (*process_auxtrace_t)(struct perf_tool *tool,
 				  union perf_event *event, void *data1,
 				  size_t len1, void *data2, size_t len2);
 
-int auxtrace_mmap__read(struct auxtrace_mmap *mm, struct auxtrace_record *itr,
+int auxtrace_mmap__read_pt(struct auxtrace_mmap *mm, struct auxtrace_record *itr,
+			struct perf_tool *tool, process_auxtrace_t fn);
+int auxtrace_mmap__read_pebs(struct auxtrace_mmap *mm, struct auxtrace_record *itr,
 			struct perf_tool *tool, process_auxtrace_t fn);
 
 int auxtrace_mmap__read_snapshot(struct auxtrace_mmap *mm,
@@ -421,6 +469,10 @@ int auxtrace_cache__add(struct auxtrace_cache *c, u32 key,
 void *auxtrace_cache__lookup(struct auxtrace_cache *c, u32 key);
 
 struct auxtrace_record *auxtrace_record__init(struct perf_evlist *evlist,
+					      int *err);
+struct auxtrace_record *auxtrace_record__init_pt(struct perf_evlist *evlist,
+					      int *err);
+struct auxtrace_record *auxtrace_record__init_pebs(struct perf_evlist *evlist,
 					      int *err);
 
 int auxtrace_parse_snapshot_options(struct auxtrace_record *itr,
@@ -474,43 +526,78 @@ size_t perf_event__fprintf_auxtrace_error(union perf_event *event, FILE *fp);
 void perf_session__auxtrace_error_inc(struct perf_session *session,
 				      union perf_event *event);
 void events_stats__auxtrace_error_warn(const struct events_stats *stats);
-
-static inline int auxtrace__process_event(struct perf_session *session,
+//PT
+static inline int auxtrace__process_event_pt(struct perf_session *session,
 					  union perf_event *event,
 					  struct perf_sample *sample,
 					  struct perf_tool *tool)
 {
-	if (!session->auxtrace)
+	if (!session->auxtrace_pt)
 		return 0;
 
-	return session->auxtrace->process_event(session, event, sample, tool);
+	return session->auxtrace_pt->process_event(session, event, sample, tool);
 }
 
-static inline int auxtrace__flush_events(struct perf_session *session,
+static inline int auxtrace__flush_events_pt(struct perf_session *session,
 					 struct perf_tool *tool)
 {
-	if (!session->auxtrace)
+	if (!session->auxtrace_pt)
 		return 0;
 
-	return session->auxtrace->flush_events(session, tool);
+	return session->auxtrace_pt->flush_events(session, tool);
 }
 
-static inline void auxtrace__free_events(struct perf_session *session)
+static inline void auxtrace__free_events_pt(struct perf_session *session)
 {
-	if (!session->auxtrace)
+	if (!session->auxtrace_pt)
 		return;
 
-	return session->auxtrace->free_events(session);
+	return session->auxtrace_pt->free_events(session);
 }
 
-static inline void auxtrace__free(struct perf_session *session)
+static inline void auxtrace__free_pt(struct perf_session *session)
 {
-	if (!session->auxtrace)
+	if (!session->auxtrace_pt)
 		return;
 
-	return session->auxtrace->free(session);
+	return session->auxtrace_pt->free(session);
+}
+//PEBS
+static inline int auxtrace__process_event_pebs(struct perf_session *session,
+					  union perf_event *event,
+					  struct perf_sample *sample,
+					  struct perf_tool *tool)
+{
+	if (!session->auxtrace_pebs)
+		return 0;
+
+	return session->auxtrace_pebs->process_event(session, event, sample, tool);
 }
 
+static inline int auxtrace__flush_events_pebs(struct perf_session *session,
+					 struct perf_tool *tool)
+{
+	if (!session->auxtrace_pebs)
+		return 0;
+
+	return session->auxtrace_pebs->flush_events(session, tool);
+}
+
+static inline void auxtrace__free_events_pebs(struct perf_session *session)
+{
+	if (!session->auxtrace_pebs)
+		return;
+
+	return session->auxtrace_pebs->free_events(session);
+}
+
+static inline void auxtrace__free_pebs(struct perf_session *session)
+{
+	if (!session->auxtrace_pebs)
+		return;
+
+	return session->auxtrace_pebs->free(session);
+}
 #else
 
 static inline struct auxtrace_record *
@@ -633,9 +720,12 @@ void auxtrace_index__free(struct list_head *head __maybe_unused)
 {
 }
 
-int auxtrace_mmap__mmap(struct auxtrace_mmap *mm,
-			struct auxtrace_mmap_params *mp,
+int auxtrace_mmap__mmap(struct auxtrace_mmap *mm_pt,
+            struct auxtrace_mmap *mm_pebs,
+			struct auxtrace_mmap_params *mp_pt,
+			struct auxtrace_mmap_params *mp_pebs,
 			void *userpg, int fd);
+
 void auxtrace_mmap__munmap(struct auxtrace_mmap *mm);
 void auxtrace_mmap_params__init(struct auxtrace_mmap_params *mp,
 				off_t auxtrace_offset,

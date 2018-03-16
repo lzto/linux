@@ -772,8 +772,12 @@ static void python_process_general_event(struct perf_sample *sample,
 					 struct addr_location *al)
 {
 	PyObject *handler, *t, *dict, *callchain, *dict_sample;
+//	PyObject *iregs_sample;
+	PyObject *uregs_sample;
+
 	static char handler_name[64];
 	unsigned n = 0;
+	unsigned rid, i=0;
 
 	/*
 	 * Use the MAX_FIELDS to make the function expandable, though
@@ -813,7 +817,38 @@ static void python_process_general_event(struct perf_sample *sample,
 			PyLong_FromUnsignedLongLong(sample->time));
 	pydict_set_item_string_decref(dict_sample, "period",
 			PyLong_FromUnsignedLongLong(sample->period));
+	pydict_set_item_string_decref(dict_sample, "to_ip",
+			PyLong_FromUnsignedLongLong(sample->addr));
 	pydict_set_item_string_decref(dict, "sample", dict_sample);
+#if 0
+	//if(sample->intr_regs.abi==PERF_SAMPLE_REGS_ABI_NONE)
+	{
+		/* add registers dump */
+		iregs_sample = PyDict_New();
+		if (!iregs_sample)
+			Py_FatalError("couldn't create Python dictionary");
+		for_each_set_bit(rid, (unsigned long *) &sample->intr_regs.mask, sizeof(sample->intr_regs.mask) * 8)
+		{
+			pydict_set_item_string_decref(iregs_sample,
+						perf_reg_name(rid),
+						PyLong_FromUnsignedLongLong(sample->intr_regs.regs[i++]));
+		}
+		pydict_set_item_string_decref(dict, "iregs", iregs_sample);
+	}
+#endif
+	{
+		/* add registers dump */
+		uregs_sample = PyDict_New();
+		if (!uregs_sample)
+			Py_FatalError("couldn't create Python dictionary");
+		for_each_set_bit(rid, (unsigned long *) &sample->user_regs.mask, sizeof(sample->user_regs.mask) * 8)
+		{
+			pydict_set_item_string_decref(uregs_sample,
+						perf_reg_name(rid),
+						PyLong_FromUnsignedLongLong(sample->user_regs.regs[i++]));
+		}
+		pydict_set_item_string_decref(dict, "uregs", uregs_sample);
+	}
 
 	pydict_set_item_string_decref(dict, "raw_buf", PyString_FromStringAndSize(
 			(const char *)sample->raw_data, sample->raw_size));

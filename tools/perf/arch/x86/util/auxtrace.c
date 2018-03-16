@@ -21,6 +21,7 @@
 #include "../../util/auxtrace.h"
 #include "../../util/intel-pt.h"
 #include "../../util/intel-bts.h"
+#include "../../util/intel-pebs.h"
 #include "../../util/evlist.h"
 
 static
@@ -29,12 +30,15 @@ struct auxtrace_record *auxtrace_record__init_intel(struct perf_evlist *evlist,
 {
 	struct perf_pmu *intel_pt_pmu;
 	struct perf_pmu *intel_bts_pmu;
+	struct perf_pmu *intel_pebs_pmu;
 	struct perf_evsel *evsel;
 	bool found_pt = false;
 	bool found_bts = false;
+	bool found_pebs = false;
 
 	intel_pt_pmu = perf_pmu__find(INTEL_PT_PMU_NAME);
 	intel_bts_pmu = perf_pmu__find(INTEL_BTS_PMU_NAME);
+	intel_pebs_pmu = perf_pmu__find(INTEL_PEBS_PMU_NAME);
 
 	if (evlist) {
 		evlist__for_each(evlist, evsel) {
@@ -44,6 +48,9 @@ struct auxtrace_record *auxtrace_record__init_intel(struct perf_evlist *evlist,
 			if (intel_bts_pmu &&
 			    evsel->attr.type == intel_bts_pmu->type)
 				found_bts = true;
+			if (intel_pebs_pmu &&
+			    evsel->attr.type == intel_pebs_pmu->type)
+				found_pebs = true;
 		}
 	}
 
@@ -58,6 +65,9 @@ struct auxtrace_record *auxtrace_record__init_intel(struct perf_evlist *evlist,
 
 	if (found_bts)
 		return intel_bts_recording_init(err);
+
+	if (found_pebs)
+		return intel_pebs_recording_init(err);
 
 	return NULL;
 }
@@ -81,3 +91,63 @@ struct auxtrace_record *auxtrace_record__init(struct perf_evlist *evlist,
 
 	return NULL;
 }
+
+static
+struct auxtrace_record *auxtrace_record__init_intel_pt(struct perf_evlist *evlist,
+						    int *err)
+{
+	struct perf_pmu *intel_pt_pmu;
+	struct perf_evsel *evsel;
+	bool found_pt = false;
+
+	intel_pt_pmu = perf_pmu__find(INTEL_PT_PMU_NAME);
+
+	if (evlist) {
+		evlist__for_each(evlist, evsel) {
+			if (intel_pt_pmu &&
+			    evsel->attr.type == intel_pt_pmu->type)
+				found_pt = true;
+		}
+	}
+
+	if (found_pt)
+		return intel_pt_recording_init(err);
+	return NULL;
+}
+
+
+static
+struct auxtrace_record *auxtrace_record__init_intel_pebs(struct perf_evlist *evlist,
+						    int *err)
+{
+	struct perf_pmu *intel_pebs_pmu;
+	struct perf_evsel *evsel;
+	bool found_pebs = false;
+
+	intel_pebs_pmu = perf_pmu__find(INTEL_PEBS_PMU_NAME);
+
+	if (evlist) {
+		evlist__for_each(evlist, evsel) {
+			if (intel_pebs_pmu &&
+			    evsel->attr.type == intel_pebs_pmu->type)
+				found_pebs = true;
+		}
+	}
+
+	if (found_pebs)
+		return intel_pebs_recording_init(err);
+	return NULL;
+}
+
+struct auxtrace_record *auxtrace_record__init_pt(struct perf_evlist *evlist,
+					      int *err)
+{
+    return auxtrace_record__init_intel_pt(evlist, err);
+}
+
+struct auxtrace_record *auxtrace_record__init_pebs(struct perf_evlist *evlist,
+					      int *err)
+{
+    return auxtrace_record__init_intel_pebs(evlist, err);
+}
+

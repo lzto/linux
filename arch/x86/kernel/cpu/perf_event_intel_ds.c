@@ -4,6 +4,8 @@
 
 #include <asm/perf_event.h>
 #include <asm/insn.h>
+#include <asm/cacheflush.h>
+
 
 #include "perf_event.h"
 
@@ -382,6 +384,9 @@ void release_ds_buffers(void)
 	if (!x86_pmu.bts && !x86_pmu.pebs)
 		return;
 
+	x86_pmu.pebs_active = 0;
+	x86_pmu.bts_active = 0;
+
 	get_online_cpus();
 	for_each_online_cpu(cpu)
 		fini_debug_store_on_cpu(cpu);
@@ -586,7 +591,9 @@ int intel_pmu_drain_bts_buffer(void)
 	event->pending_kill = POLL_IN;
 	return 1;
 }
-
+/*
+ * FIXME: do not use drain when using aux buffer
+ */
 static inline void intel_pmu_drain_pebs_buffer(void)
 {
 	struct pt_regs regs;
@@ -594,10 +601,19 @@ static inline void intel_pmu_drain_pebs_buffer(void)
 	x86_pmu.drain_pebs(&regs);
 }
 
+extern int intel_pebs_drain(bool);
+
 void intel_pmu_pebs_sched_task(struct perf_event_context *ctx, bool sched_in)
 {
-	if (!sched_in)
-		intel_pmu_drain_pebs_buffer();
+	if(!ctx)
+	{
+		WARN_ONCE(!ctx, "intel_pmu_pebs_sched_task, how come"
+				" ctx is NULL?\n");
+		return;
+	}
+	if (!sched_in && ctx)
+        if (intel_pebs_drain(true)==0)
+	    	intel_pmu_drain_pebs_buffer();
 }
 
 /*
@@ -769,6 +785,8 @@ static inline bool pebs_is_enabled(struct cpu_hw_events *cpuc)
 	return (cpuc->pebs_enabled & ((1ULL << MAX_PEBS_EVENTS) - 1));
 }
 
+extern int get_cb_usage(void);
+
 void intel_pmu_pebs_enable(struct perf_event *event)
 {
 	struct cpu_hw_events *cpuc = this_cpu_ptr(&cpu_hw_events);
@@ -776,6 +794,7 @@ void intel_pmu_pebs_enable(struct perf_event *event)
 	struct debug_store *ds = cpuc->ds;
 	bool first_pebs;
 	u64 threshold;
+	int max_samples;
 
 	hwc->config &= ~ARCH_PERFMON_EVENTSEL_INT;
 
@@ -792,11 +811,15 @@ void intel_pmu_pebs_enable(struct perf_event *event)
 	 * threshold and run the event with less frequent PMI.
 	 */
 	if (hwc->flags & PERF_X86_EVENT_FREERUNNING) {
-		threshold = ds->pebs_absolute_maximum -
-			x86_pmu.max_pebs_events * x86_pmu.pebs_record_size;
-
+		max_samples = 
+			(ds->pebs_absolute_maximum - ds->pebs_buffer_base) /
+			x86_pmu.pebs_record_size;
+		threshold = ds->pebs_buffer_base + 
+			(max_samples - 5) * x86_pmu.pebs_record_size;
+		
 		if (first_pebs)
 			perf_sched_cb_inc(event->ctx->pmu);
+
 	} else {
 		threshold = ds->pebs_buffer_base + x86_pmu.pebs_record_size;
 
@@ -808,7 +831,6 @@ void intel_pmu_pebs_enable(struct perf_event *event)
 		    (ds->pebs_interrupt_threshold > threshold))
 			perf_sched_cb_dec(event->ctx->pmu);
 	}
-
 	/* Use auto-reload if possible to save a MSR write in the PMI */
 	if (hwc->flags & PERF_X86_EVENT_AUTO_RELOAD) {
 		ds->pebs_event_reset[hwc->idx] =
@@ -828,7 +850,8 @@ void intel_pmu_pebs_disable(struct perf_event *event)
 		ds->pebs_buffer_base + x86_pmu.pebs_record_size;
 
 	if (large_pebs)
-		intel_pmu_drain_pebs_buffer();
+        if (intel_pebs_drain(true)==0)
+	    	intel_pmu_drain_pebs_buffer();
 
 	cpuc->pebs_enabled &= ~(1ULL << hwc->idx);
 
@@ -851,7 +874,10 @@ void intel_pmu_pebs_enable_all(void)
 	struct cpu_hw_events *cpuc = this_cpu_ptr(&cpu_hw_events);
 
 	if (cpuc->pebs_enabled)
+	{
 		wrmsrl(MSR_IA32_PEBS_ENABLE, cpuc->pebs_enabled);
+	}
+
 }
 
 void intel_pmu_pebs_disable_all(void)
@@ -859,7 +885,9 @@ void intel_pmu_pebs_disable_all(void)
 	struct cpu_hw_events *cpuc = this_cpu_ptr(&cpu_hw_events);
 
 	if (cpuc->pebs_enabled)
+    {
 		wrmsrl(MSR_IA32_PEBS_ENABLE, 0);
+    }
 }
 
 static int intel_pmu_pebs_fixup_ip(struct pt_regs *regs)
@@ -996,6 +1024,9 @@ static void setup_pebs_sample_data(struct perf_event *event,
 
 	if (pebs == NULL)
 		return;
+
+	if(x86_pmu.intel_cap.pebs_format >= 3)
+		event->attr.sample_type |= PERF_SAMPLE_REGS_INTR;
 
 	sample_type = event->attr.sample_type;
 	dsrc = sample_type & PERF_SAMPLE_DATA_SRC;
@@ -1146,18 +1177,54 @@ static void __intel_pmu_pebs_event(struct perf_event *event,
 {
 	struct perf_sample_data data;
 	struct pt_regs regs;
+
+	struct perf_itrace_filter *filter;
+
 	void *at = get_next_pebs_record_by_bit(base, top, bit);
 
 	if (!intel_pmu_save_and_restart(event) &&
 	    !(event->hw.flags & PERF_X86_EVENT_AUTO_RELOAD))
+	{
 		return;
+	}
 
-	while (count > 1) {
-		setup_pebs_sample_data(event, iregs, at, &data, &regs);
-		perf_event_output(event, &data, &regs);
-		at += x86_pmu.pebs_record_size;
-		at = get_next_pebs_record_by_bit(at, top, bit);
-		count--;
+	//FIXME: need optimization
+	//FIXME: only support one filter for now.
+	//avoid excessive condition misprediction,
+	//yield ~(0.5,1)s for busyloop, 1000 period, 10^9 max sampling rate
+	filter = list_first_or_null_rcu(&event->itrace_filters, struct perf_itrace_filter, entry);
+
+	if (filter)
+	{
+		struct pebs_record_skl *pebs;
+		while (count > 1) {
+			pebs = at;
+			if ((pebs->real_ip >= (u64)filter->start) && 
+				(pebs->real_ip <= (u64)filter->end))
+			{
+				setup_pebs_sample_data(event, iregs, at, &data, &regs);
+				perf_event_output(event, &data, &regs);
+			}
+			at += x86_pmu.pebs_record_size;
+			at = get_next_pebs_record_by_bit(at, top, bit);
+			count--;
+		}
+		pebs = at;
+		if (!((pebs->real_ip >= (u64)filter->start) && 
+			(pebs->real_ip <= (u64)filter->end)))
+		{
+			return;
+		}
+
+	}else
+	{
+		while (count > 1) {
+			setup_pebs_sample_data(event, iregs, at, &data, &regs);
+			perf_event_output(event, &data, &regs);
+			at += x86_pmu.pebs_record_size;
+			at = get_next_pebs_record_by_bit(at, top, bit);
+			count--;
+		}
 	}
 
 	setup_pebs_sample_data(event, iregs, at, &data, &regs);
@@ -1207,6 +1274,7 @@ static void intel_pmu_drain_pebs_core(struct pt_regs *iregs)
 	__intel_pmu_pebs_event(event, iregs, at, top, 0, n);
 }
 
+//FIXME! skip traverasl if using aux buffer
 static void intel_pmu_drain_pebs_nhm(struct pt_regs *iregs)
 {
 	struct cpu_hw_events *cpuc = this_cpu_ptr(&cpu_hw_events);
@@ -1216,7 +1284,7 @@ static void intel_pmu_drain_pebs_nhm(struct pt_regs *iregs)
 	short counts[MAX_PEBS_EVENTS] = {};
 	short error[MAX_PEBS_EVENTS] = {};
 	int bit, i;
-
+    
 	if (!x86_pmu.pebs_active)
 		return;
 
@@ -1305,6 +1373,26 @@ static void intel_pmu_drain_pebs_nhm(struct pt_regs *iregs)
 	}
 }
 
+static int ds_itrace_filter_setup(struct perf_event *event)
+{
+//TODO: store in PMU filter?
+#if 0
+	struct perf_itrace_filter *filter = NULL;
+	printk("ds_itrace_filter on cpu %d for cpu %d:\n",
+			smp_processor_id(),
+			event->cpu);
+	list_for_each_entry_rcu(filter, &event->itrace_filters, entry)
+	{
+		printk("    %d,%d: [0x%lx,0x%lx]\n",
+				smp_processor_id(),
+				event->cpu,
+				filter->start,
+				filter->end);
+	}
+#endif
+	return 0;
+}
+
 /*
  * BTS, PEBS probe and setup
  */
@@ -1316,6 +1404,9 @@ void __init intel_ds_init(void)
 	 */
 	if (!boot_cpu_has(X86_FEATURE_DTES64))
 		return;
+
+	//PEBS software based IP Filter
+	x86_pmu.itrace_filter_setup = ds_itrace_filter_setup;
 
 	x86_pmu.bts  = boot_cpu_has(X86_FEATURE_BTS);
 	x86_pmu.pebs = boot_cpu_has(X86_FEATURE_PEBS);

@@ -44,6 +44,8 @@
 #include <linux/compat.h>
 #include <linux/bpf.h>
 #include <linux/filter.h>
+#include <linux/namei.h>
+#include <linux/parser.h>
 
 #include "internal.h"
 
@@ -353,8 +355,8 @@ static struct srcu_struct pmus_srcu;
  */
 int sysctl_perf_event_paranoid __read_mostly = 1;
 
-/* Minimum for 512 kiB + 1 user control page */
-int sysctl_perf_event_mlock __read_mostly = 512 + (PAGE_SIZE / 1024); /* 'free' kiB per user */
+/* Minimum for 1024 kiB + 1 user control page */
+int sysctl_perf_event_mlock __read_mostly = 1024 + (PAGE_SIZE / 1024); /* 'free' kiB per user */
 
 /*
  * max perf event sample rate
@@ -468,13 +470,13 @@ void perf_sample_event_took(u64 sample_len_ns)
 
 	if (max_samples_per_tick <= 1)
 		return;
-
+#if 0
 	max_samples_per_tick = DIV_ROUND_UP(max_samples_per_tick, 2);
 	sysctl_perf_event_sample_rate = max_samples_per_tick * HZ;
 	perf_sample_period_ns = NSEC_PER_SEC / sysctl_perf_event_sample_rate;
 
 	update_perf_cpu_limits();
-
+#endif
 	if (!irq_work_queue(&perf_duration_work)) {
 		early_printk("perf interrupt took too long (%lld > %lld), lowering "
 			     "kernel.perf_event_max_sample_rate to %d\n",
@@ -2343,6 +2345,59 @@ void perf_event_enable(struct perf_event *event)
 }
 EXPORT_SYMBOL_GPL(perf_event_enable);
 
+static int __perf_event_itrace_filters_setup(void *info)
+{
+	struct perf_event *event = info;
+	int ret;
+
+	if (READ_ONCE(event->state) != PERF_EVENT_STATE_ACTIVE)
+		return -EAGAIN;
+
+	/* matches smp_wmb() in event_sched_in() */
+	smp_rmb();
+
+	/*
+	 * There is a window with interrupts enabled before we get here,
+	 * so we need to check again lest we try to stop another cpu's event.
+	 */
+	if (READ_ONCE(event->oncpu) != smp_processor_id())
+		return -EAGAIN;
+
+	event->pmu->stop(event, PERF_EF_UPDATE);
+	rcu_read_lock();
+	ret = event->pmu->itrace_filter_setup(event);
+	rcu_read_unlock();
+	event->pmu->start(event, PERF_EF_RELOAD);
+
+	return ret;
+}
+
+static int perf_event_itrace_filters_setup(struct perf_event *event)
+{
+	int ret;
+
+	/*
+	 * We can't use event_function_call() here, because that would
+	 * require ctx::mutex, but one of our callers is called with
+	 * mm::mmap_sem down, which would cause an inversion, see bullet
+	 * (2) in put_event().
+	 */
+	do {
+		if (READ_ONCE(event->state) != PERF_EVENT_STATE_ACTIVE) {
+			ret = event->pmu->itrace_filter_setup(event);
+			break;
+		}
+
+		/* matches smp_wmb() in event_sched_in() */
+		smp_rmb();
+
+		ret = cpu_function_call(READ_ONCE(event->oncpu),
+					__perf_event_itrace_filters_setup, event);
+	} while (ret == -EAGAIN);
+
+	return ret;
+}
+
 static int _perf_event_refresh(struct perf_event *event, int refresh)
 {
 	/*
@@ -2609,6 +2664,11 @@ unlock:
 	}
 }
 
+int get_cb_usage(void)
+{
+	return __this_cpu_read(perf_sched_cb_usages);
+}
+
 void perf_sched_cb_dec(struct pmu *pmu)
 {
 	this_cpu_dec(perf_sched_cb_usages);
@@ -2631,6 +2691,10 @@ static void perf_pmu_sched_task(struct task_struct *prev,
 	struct pmu *pmu;
 	unsigned long flags;
 
+	//printk("---SCHED B---\n"
+	//	"$ perf_pmu_sched_task : IO? %d \n",
+	//	sched_in);
+
 	if (prev == next)
 		return;
 
@@ -2639,6 +2703,7 @@ static void perf_pmu_sched_task(struct task_struct *prev,
 	rcu_read_lock();
 
 	list_for_each_entry_rcu(pmu, &pmus, entry) {
+		//printk("  PMU: %s\n",pmu->name);
 		if (pmu->sched_task) {
 			cpuctx = this_cpu_ptr(pmu->pmu_cpu_context);
 
@@ -2657,6 +2722,7 @@ static void perf_pmu_sched_task(struct task_struct *prev,
 	rcu_read_unlock();
 
 	local_irq_restore(flags);
+	//printk("---SCHED E---\n");
 }
 
 static void perf_event_switch(struct task_struct *task,
@@ -3691,6 +3757,8 @@ static bool exclusive_event_installable(struct perf_event *event,
 	return true;
 }
 
+static void perf_itrace_filters_clear(struct perf_event *event);
+
 static void _free_event(struct perf_event *event)
 {
 	irq_work_sync(&event->pending);
@@ -3718,6 +3786,7 @@ static void _free_event(struct perf_event *event)
 	}
 
 	perf_event_free_bpf_prog(event);
+	perf_itrace_filters_clear(event);
 
 	if (event->destroy)
 		event->destroy(event);
@@ -4616,7 +4685,10 @@ static void perf_mmap_open(struct vm_area_struct *vma)
 	atomic_inc(&event->rb->mmap_count);
 
 	if (vma->vm_pgoff)
-		atomic_inc(&event->rb->aux_mmap_count);
+    {
+		atomic_inc(&event->rb->aux_mmap_count_pt);
+		atomic_inc(&event->rb->aux_mmap_count_pebs);
+    }
 
 	if (event->pmu->event_mapped)
 		event->pmu->event_mapped(event);
@@ -4647,11 +4719,22 @@ static void perf_mmap_close(struct vm_area_struct *vma)
 	 * event->mmap_count, so it is ok to use event->mmap_mutex to
 	 * serialize with perf_mmap here.
 	 */
-	if (rb_has_aux(rb) && vma->vm_pgoff == rb->aux_pgoff &&
-	    atomic_dec_and_mutex_lock(&rb->aux_mmap_count, &event->mmap_mutex)) {
-		atomic_long_sub(rb->aux_nr_pages, &mmap_user->locked_vm);
-		vma->vm_mm->pinned_vm -= rb->aux_mmap_locked;
-
+	if ((rb_has_aux_pt(rb) || rb_has_aux_pebs(rb)) &&
+        vma->vm_pgoff == rb->aux_pgoff)
+    {
+        mutex_lock(&event->mmap_mutex);
+        if (rb_has_aux_pt(rb))
+        {
+            atomic_dec(&rb->aux_mmap_count_pt);
+            atomic_long_sub(rb->aux_nr_pages_pt, &mmap_user->locked_vm);
+            vma->vm_mm->pinned_vm -= rb->aux_mmap_locked_pt;
+        }
+        if (rb_has_aux_pebs(rb))
+        {
+            atomic_dec(&rb->aux_mmap_count_pebs);
+            atomic_long_sub(rb->aux_nr_pages_pebs, &mmap_user->locked_vm);
+            vma->vm_mm->pinned_vm -= rb->aux_mmap_locked_pebs;
+        }
 		rb_free_aux(rb);
 		mutex_unlock(&event->mmap_mutex);
 	}
@@ -4768,7 +4851,6 @@ static int perf_mmap(struct file *file, struct vm_area_struct *vma)
 		 * and offset. Must be above the normal perf buffer.
 		 */
 		u64 aux_offset, aux_size;
-
 		if (!event->rb)
 			return -EINVAL;
 
@@ -4781,8 +4863,9 @@ static int perf_mmap(struct file *file, struct vm_area_struct *vma)
 		if (!rb)
 			goto aux_unlock;
 
-		aux_offset = ACCESS_ONCE(rb->user_page->aux_offset);
-		aux_size = ACCESS_ONCE(rb->user_page->aux_size);
+		aux_offset = ACCESS_ONCE(rb->user_page->aux_offset_pt);
+		aux_size = ACCESS_ONCE(rb->user_page->aux_size_pt) +
+                   ACCESS_ONCE(rb->user_page->aux_size_pebs);
 
 		if (aux_offset < perf_data_size(rb) + PAGE_SIZE)
 			goto aux_unlock;
@@ -4791,14 +4874,16 @@ static int perf_mmap(struct file *file, struct vm_area_struct *vma)
 			goto aux_unlock;
 
 		/* already mapped with a different offset */
-		if (rb_has_aux(rb) && rb->aux_pgoff != vma->vm_pgoff)
+		if ((rb_has_aux_pt(rb) || rb_has_aux_pebs(rb))
+            && rb->aux_pgoff != vma->vm_pgoff)
 			goto aux_unlock;
 
 		if (aux_size != vma_size || aux_size != nr_pages * PAGE_SIZE)
 			goto aux_unlock;
 
 		/* already mapped with a different size */
-		if (rb_has_aux(rb) && rb->aux_nr_pages != nr_pages)
+		if ((rb_has_aux_pt(rb) || rb_has_aux_pebs(rb)) &&
+            (rb->aux_nr_pages_pt + rb->aux_nr_pages_pebs)!= nr_pages)
 			goto aux_unlock;
 
 		if (!is_power_of_2(nr_pages))
@@ -4807,13 +4892,15 @@ static int perf_mmap(struct file *file, struct vm_area_struct *vma)
 		if (!atomic_inc_not_zero(&rb->mmap_count))
 			goto aux_unlock;
 
-		if (rb_has_aux(rb)) {
-			atomic_inc(&rb->aux_mmap_count);
+		if (rb_has_aux_pt(rb) || rb_has_aux_pebs(rb)) {
+			atomic_inc(&rb->aux_mmap_count_pt);
+			atomic_inc(&rb->aux_mmap_count_pebs);
 			ret = 0;
 			goto unlock;
 		}
 
-		atomic_set(&rb->aux_mmap_count, 1);
+		atomic_set(&rb->aux_mmap_count_pt, 1);
+		atomic_set(&rb->aux_mmap_count_pebs, 1);
 		user_extra = nr_pages;
 
 		goto accounting;
@@ -4903,7 +4990,10 @@ accounting:
 		ret = rb_alloc_aux(rb, event, vma->vm_pgoff, nr_pages,
 				   event->attr.aux_watermark, flags);
 		if (!ret)
-			rb->aux_mmap_locked = extra;
+        {
+			rb->aux_mmap_locked_pt = extra/2;
+			rb->aux_mmap_locked_pebs = extra/2;
+        }
 	}
 
 unlock:
@@ -5179,8 +5269,13 @@ static void __perf_event_header__init_id(struct perf_event_header *header,
 	}
 
 	if (sample_type & PERF_SAMPLE_TIME)
-		data->time = perf_event_clock(event);
-
+	{
+		/*
+		 * FIXME! this is going to overwrite PEBS timestamp
+		 */
+		if(data->time==0)
+			data->time = perf_event_clock(event);
+	}
 	if (sample_type & (PERF_SAMPLE_ID | PERF_SAMPLE_IDENTIFIER))
 		data->id = primary_event_id(event);
 
@@ -5632,7 +5727,9 @@ perf_event_read_event(struct perf_event *event,
 			struct task_struct *task)
 {
 	struct perf_output_handle handle;
-	struct perf_sample_data sample;
+	struct perf_sample_data sample = {
+		.time = 0,
+	};
 	struct perf_read_event read_event = {
 		.header = {
 			.type = PERF_RECORD_READ,
@@ -5661,33 +5758,36 @@ typedef void (perf_event_aux_output_cb)(struct perf_event *event, void *data);
 static void
 perf_event_aux_ctx(struct perf_event_context *ctx,
 		   perf_event_aux_output_cb output,
-		   void *data)
+		   void *data, bool all)
 {
 	struct perf_event *event;
 
 	list_for_each_entry_rcu(event, &ctx->event_list, event_entry) {
-		if (event->state < PERF_EVENT_STATE_INACTIVE)
-			continue;
-		if (!event_filter_match(event))
-			continue;
+		if (!all) {
+			if (event->state < PERF_EVENT_STATE_INACTIVE)
+				continue;
+			if (!event_filter_match(event))
+				continue;
+		}
+
 		output(event, data);
 	}
 }
 
 static void
 perf_event_aux_task_ctx(perf_event_aux_output_cb output, void *data,
-			struct perf_event_context *task_ctx)
+			struct perf_event_context *task_ctx, bool all)
 {
 	rcu_read_lock();
 	preempt_disable();
-	perf_event_aux_ctx(task_ctx, output, data);
+	perf_event_aux_ctx(task_ctx, output, data, all);
 	preempt_enable();
 	rcu_read_unlock();
 }
 
 static void
 perf_event_aux(perf_event_aux_output_cb output, void *data,
-	       struct perf_event_context *task_ctx)
+	       struct perf_event_context *task_ctx, bool all)
 {
 	struct perf_cpu_context *cpuctx;
 	struct perf_event_context *ctx;
@@ -5701,7 +5801,7 @@ perf_event_aux(perf_event_aux_output_cb output, void *data,
 	 * context.
 	 */
 	if (task_ctx) {
-		perf_event_aux_task_ctx(output, data, task_ctx);
+		perf_event_aux_task_ctx(output, data, task_ctx, all);
 		return;
 	}
 
@@ -5710,13 +5810,13 @@ perf_event_aux(perf_event_aux_output_cb output, void *data,
 		cpuctx = get_cpu_ptr(pmu->pmu_cpu_context);
 		if (cpuctx->unique_pmu != pmu)
 			goto next;
-		perf_event_aux_ctx(&cpuctx->ctx, output, data);
+		perf_event_aux_ctx(&cpuctx->ctx, output, data, all);
 		ctxn = pmu->task_ctx_nr;
 		if (ctxn < 0)
 			goto next;
 		ctx = rcu_dereference(current->perf_event_ctxp[ctxn]);
 		if (ctx)
-			perf_event_aux_ctx(ctx, output, data);
+			perf_event_aux_ctx(ctx, output, data, all);
 next:
 		put_cpu_ptr(pmu->pmu_cpu_context);
 	}
@@ -5756,7 +5856,9 @@ static void perf_event_task_output(struct perf_event *event,
 {
 	struct perf_task_event *task_event = data;
 	struct perf_output_handle handle;
-	struct perf_sample_data	sample;
+	struct perf_sample_data	sample = {
+		.time = 0,
+	};
 	struct task_struct *task = task_event->task;
 	int ret, size = task_event->event_id.header.size;
 
@@ -5817,7 +5919,7 @@ static void perf_event_task(struct task_struct *task,
 
 	perf_event_aux(perf_event_task_output,
 		       &task_event,
-		       task_ctx);
+		       task_ctx, false);
 }
 
 void perf_event_fork(struct task_struct *task)
@@ -5852,7 +5954,9 @@ static void perf_event_comm_output(struct perf_event *event,
 {
 	struct perf_comm_event *comm_event = data;
 	struct perf_output_handle handle;
-	struct perf_sample_data sample;
+	struct perf_sample_data sample = {
+		.time = 0,
+	};
 	int size = comm_event->event_id.header.size;
 	int ret;
 
@@ -5880,6 +5984,37 @@ out:
 	comm_event->event_id.header.size = size;
 }
 
+/*
+ * Clear all dynamic object-based filters at exec, they'll have to be
+ * re-instated when/if these objects are mmapped again.
+ */
+static void perf_itrace_exec(struct perf_event *event, void *data)
+{
+	struct perf_itrace_filter *filter;
+	unsigned int restart = 0;
+
+	if (!has_itrace_filter(event))
+		return;
+
+	rcu_read_lock();
+
+	list_for_each_entry_rcu(filter, &event->itrace_filters, entry) {
+		if (filter->kernel)
+			continue;
+
+		filter->start = filter->end = 0;
+		restart++;
+	}
+
+	rcu_read_unlock();
+
+	/*
+	 * kernel filters, however, will still be valid
+	 */
+	if (restart)
+		perf_event_itrace_filters_setup(event);
+}
+
 static void perf_event_comm_event(struct perf_comm_event *comm_event)
 {
 	char comm[TASK_COMM_LEN];
@@ -5894,9 +6029,11 @@ static void perf_event_comm_event(struct perf_comm_event *comm_event)
 
 	comm_event->event_id.header.size = sizeof(comm_event->event_id) + size;
 
+	if (comm_event->event_id.header.misc == PERF_RECORD_MISC_COMM_EXEC)
+		perf_event_aux(perf_itrace_exec, comm_event, NULL, true);
 	perf_event_aux(perf_event_comm_output,
 		       comm_event,
-		       NULL);
+		       NULL, false);
 }
 
 void perf_event_comm(struct task_struct *task, bool exec)
@@ -5965,7 +6102,9 @@ static void perf_event_mmap_output(struct perf_event *event,
 {
 	struct perf_mmap_event *mmap_event = data;
 	struct perf_output_handle handle;
-	struct perf_sample_data sample;
+	struct perf_sample_data sample = {
+		.time = 0,
+	};
 	int size = mmap_event->event_id.header.size;
 	int ret;
 
@@ -6127,9 +6266,86 @@ got_name:
 
 	perf_event_aux(perf_event_mmap_output,
 		       mmap_event,
-		       NULL);
+		       NULL, false);
 
 	kfree(buf);
+}
+
+/*
+ * Whether this @filter depends on a dynamic object which is not loaded
+ * yet or its load addresses are not known.
+ */
+static bool perf_itrace_filter_needs_mmap(struct perf_itrace_filter *filter)
+{
+	return filter->filter && !filter->kernel && !filter->end;
+}
+
+/*
+ * Check whether inode and address range match filter criteria.
+ */
+static bool perf_itrace_filter_match(struct perf_itrace_filter *filter,
+				     struct file *file, unsigned long offset,
+				     unsigned long size)
+{
+
+	if (filter->inode != file->f_inode)
+		return false;
+
+	if (filter->offset > offset + size)
+		return false;
+
+	if (filter->offset + filter->size < offset)
+		return false;
+
+	return true;
+}
+
+/*
+ * Update event's itrace filters
+ */
+static void perf_itrace_filters_update(struct perf_event *event, void *data)
+{
+	struct perf_mmap_event *mmap_event = data;
+	unsigned long off = mmap_event->vma->vm_pgoff << PAGE_SHIFT;
+	struct file *file = mmap_event->vma->vm_file;
+	struct perf_itrace_filter *filter;
+	unsigned int restart = 0;
+
+	if (!has_itrace_filter(event))
+		return;
+
+	if (!file)
+		return;
+
+	/* we do not modify the list or sleep, no need for the mutex */
+	rcu_read_lock();
+	list_for_each_entry_rcu(filter, &event->itrace_filters, entry) {
+		if (filter->kernel)
+			continue;
+
+		//check whether the mapped area is executable
+		if ((mmap_event->vma->vm_flags & VM_EXEC) != VM_EXEC)
+		{
+			continue;
+		}
+
+		if (filter->task->mm != mmap_event->vma->vm_mm)
+			continue;
+		
+		if (!perf_itrace_filter_match(filter, file, off,
+					      mmap_event->event_id.len))
+			continue;
+
+		restart++;
+		filter->start = mmap_event->event_id.start + filter->offset;
+		filter->end = mmap_event->event_id.start + filter->offset +
+			filter->size;
+		}
+	rcu_read_unlock();
+
+	/* reprogram updated filters into hardware */
+	if (restart)
+		perf_event_itrace_filters_setup(event);
 }
 
 void perf_event_mmap(struct vm_area_struct *vma)
@@ -6163,6 +6379,7 @@ void perf_event_mmap(struct vm_area_struct *vma)
 		/* .flags (attr_mmap2 only) */
 	};
 
+	perf_event_aux(perf_itrace_filters_update, &mmap_event, NULL, true);
 	perf_event_mmap_event(&mmap_event);
 }
 
@@ -6170,7 +6387,9 @@ void perf_event_aux_event(struct perf_event *event, unsigned long head,
 			  unsigned long size, u64 flags)
 {
 	struct perf_output_handle handle;
-	struct perf_sample_data sample;
+	struct perf_sample_data sample = {
+		.time = 0,
+	};
 	struct perf_aux_event {
 		struct perf_event_header	header;
 		u64				offset;
@@ -6206,7 +6425,9 @@ void perf_event_aux_event(struct perf_event *event, unsigned long head,
 void perf_log_lost_samples(struct perf_event *event, u64 lost)
 {
 	struct perf_output_handle handle;
-	struct perf_sample_data sample;
+	struct perf_sample_data sample = {
+		.time = 0,
+	};
 	int ret;
 
 	struct {
@@ -6257,7 +6478,9 @@ static void perf_event_switch_output(struct perf_event *event, void *data)
 {
 	struct perf_switch_event *se = data;
 	struct perf_output_handle handle;
-	struct perf_sample_data sample;
+	struct perf_sample_data sample = {
+		.time = 0,
+	};
 	int ret;
 
 	if (!perf_event_switch_match(event))
@@ -6315,7 +6538,7 @@ static void perf_event_switch(struct task_struct *task,
 
 	perf_event_aux(perf_event_switch_output,
 		       &switch_event,
-		       NULL);
+		       NULL, false);
 }
 
 /*
@@ -6325,7 +6548,9 @@ static void perf_event_switch(struct task_struct *task,
 static void perf_log_throttle(struct perf_event *event, int enable)
 {
 	struct perf_output_handle handle;
-	struct perf_sample_data sample;
+	struct perf_sample_data sample = {
+		.time = 0,
+	};
 	int ret;
 
 	struct {
@@ -6362,7 +6587,9 @@ static void perf_log_throttle(struct perf_event *event, int enable)
 static void perf_log_itrace_start(struct perf_event *event)
 {
 	struct perf_output_handle handle;
-	struct perf_sample_data sample;
+	struct perf_sample_data sample = {
+		.time = 0,
+	};
 	struct perf_aux_event {
 		struct perf_event_header        header;
 		u32				pid;
@@ -6421,6 +6648,8 @@ static int __perf_event_overflow(struct perf_event *event,
 		hwc->interrupts = 1;
 	} else {
 		hwc->interrupts++;
+#if 0
+//disable throttling
 		if (unlikely(throttle
 			     && hwc->interrupts >= max_samples_per_tick)) {
 			__this_cpu_inc(perf_throttled_count);
@@ -6429,6 +6658,7 @@ static int __perf_event_overflow(struct perf_event *event,
 			tick_nohz_full_kick();
 			ret = 1;
 		}
+#endif
 	}
 
 	if (event->attr.freq) {
@@ -6533,6 +6763,7 @@ static void perf_swevent_overflow(struct perf_event *event, u64 overflow,
 		return;
 
 	for (; overflow; overflow--) {
+		data->time = 0;
 		if (__perf_event_overflow(event, throttle,
 					    data, regs)) {
 			/*
@@ -6673,6 +6904,7 @@ static void do_perf_sw_event(enum perf_type_id type, u32 event_id,
 		goto end;
 
 	hlist_for_each_entry_rcu(event, head, hlist_entry) {
+		data->time = 0;
 		if (perf_swevent_match(event, type, event_id, data, regs))
 			perf_swevent_event(event, nr, data, regs);
 	}
@@ -7045,24 +7277,6 @@ static inline void perf_tp_register(void)
 	perf_pmu_register(&perf_tracepoint, "tracepoint", PERF_TYPE_TRACEPOINT);
 }
 
-static int perf_event_set_filter(struct perf_event *event, void __user *arg)
-{
-	char *filter_str;
-	int ret;
-
-	if (event->attr.type != PERF_TYPE_TRACEPOINT)
-		return -EINVAL;
-
-	filter_str = strndup_user(arg, PAGE_SIZE);
-	if (IS_ERR(filter_str))
-		return PTR_ERR(filter_str);
-
-	ret = ftrace_profile_set_filter(event, event->attr.config, filter_str);
-
-	kfree(filter_str);
-	return ret;
-}
-
 static void perf_event_free_filter(struct perf_event *event)
 {
 	ftrace_profile_free_filter(event);
@@ -7117,11 +7331,6 @@ static inline void perf_tp_register(void)
 {
 }
 
-static int perf_event_set_filter(struct perf_event *event, void __user *arg)
-{
-	return -ENOENT;
-}
-
 static void perf_event_free_filter(struct perf_event *event)
 {
 }
@@ -7148,6 +7357,420 @@ void perf_bp_event(struct perf_event *bp, void *data)
 		perf_swevent_event(bp, 1, &sample, regs);
 }
 #endif
+
+/*
+ * Insert an itrace @filter into @event's list of filters.
+ * @filter is used as a template
+ */
+static int perf_itrace_filter_insert(struct perf_event *event,
+				     struct perf_itrace_filter *src,
+				     struct task_struct *task)
+{
+	int node = cpu_to_node(event->cpu == -1 ? 0 : event->cpu);
+	struct perf_itrace_filter *filter;
+
+	filter = kzalloc_node(sizeof(*filter), GFP_KERNEL, node);
+	if (!filter)
+		return -ENOMEM;
+
+	filter->inode  = src->inode;
+	filter->offset = src->offset;
+	filter->size   = src->size;
+	filter->range  = src->range;
+	filter->filter = src->filter;
+	filter->kernel = src->kernel;
+	/*
+	 * We copy the actual address range too: it will remain the same for
+	 * kernel addresses and user addresses after fork(); in case of exec
+	 * or mmap, it will get cleared or modified by
+	 * perf_itrace_filters_clear()/perf_itrace_filters_update().
+	 */
+	filter->start = src->start;
+	filter->end = src->end;
+
+	/*
+	 * We're already holding a reference to this task_struct since
+	 * alloc_perf_context() till last put_ctx() in __free_event().
+	 */
+	filter->task = task;
+
+	/*
+	 * If we're called through perf_itrace_filters_clone(), we're already
+	 * holding parent's filter mutex.
+	 */
+	mutex_lock_nested(&event->itrace_filters_mutex, SINGLE_DEPTH_NESTING);
+	list_add_tail_rcu(&filter->entry, &event->itrace_filters);
+	mutex_unlock(&event->itrace_filters_mutex);
+
+	return 0;
+}
+
+static void perf_itrace_filter_free_rcu(struct rcu_head *rcu_head)
+{
+	struct perf_itrace_filter *filter =
+		container_of(rcu_head, struct perf_itrace_filter, rcu_head);
+
+	if (filter->inode)
+		iput(filter->inode);
+	kfree(filter);
+}
+
+/*
+ * we can do this via task_function_call(), as well as setting filters
+ * and maybe event updating them!
+ */
+static void perf_itrace_filters_clear(struct perf_event *event)
+{
+	struct perf_itrace_filter *filter, *iter;
+
+	if (!has_itrace_filter(event))
+		return;
+
+	mutex_lock(&event->itrace_filters_mutex);
+	list_for_each_entry_safe(filter, iter, &event->itrace_filters, entry) {
+		list_del_rcu(&filter->entry);
+		call_rcu(&filter->rcu_head, perf_itrace_filter_free_rcu);
+	}
+
+	perf_event_itrace_filters_setup(event);
+	mutex_unlock(&event->itrace_filters_mutex);
+}
+
+/*
+ * Scan through mm's vmas and see if one of them matches the
+ * @filter; if so, adjust filter's address range.
+ * Called with mm::mmap_sem down for reading.
+ */
+static int perf_itrace_filter_apply(struct perf_event *event,
+				    struct perf_itrace_filter *filter,
+				    struct mm_struct *mm)
+{
+	struct vm_area_struct *vma;
+
+	for (vma = mm->mmap; vma->vm_next; vma = vma->vm_next) {
+		struct file *file = vma->vm_file;
+		unsigned long off = vma->vm_pgoff << PAGE_SHIFT;
+		unsigned long vma_size = vma->vm_end - vma->vm_start;
+
+		if (!file)
+			continue;
+
+		if (!perf_itrace_filter_match(filter, file, off,
+					      vma_size))
+			continue;
+		filter->start = vma->vm_start + filter->offset;
+		filter->end = vma->vm_start + filter->offset +
+			filter->size;
+
+		return 1;
+	}
+	return 0;
+}
+
+/*
+ * Adjust event's itrace filters' address ranges based on the
+ * task's existing mappings
+ */
+static void perf_itrace_filters_apply(struct perf_event *event)
+{
+	struct perf_itrace_filter *filter;
+	struct mm_struct *mm = NULL;
+	unsigned int restart = 0;
+
+	lockdep_assert_held(&event->ctx->mutex);
+
+	mm = get_task_mm(event->ctx->task);
+	if (!mm)
+		return;
+
+	down_read(&mm->mmap_sem);
+
+	rcu_read_lock();
+	list_for_each_entry_rcu(filter, &event->itrace_filters, entry) {
+		if (!perf_itrace_filter_needs_mmap(filter))
+			continue;
+
+		restart += perf_itrace_filter_apply(event, filter, mm);
+	}
+	rcu_read_unlock();
+
+	up_read(&mm->mmap_sem);
+
+	if (restart)
+		perf_event_itrace_filters_setup(event);
+
+	mmput(mm);
+}
+
+/*
+ * Instruction trace filtering: limiting the trace to certain
+ * instruction address ranges. Filters are ioctl()ed to us from
+ * userspace as ascii strings.
+ *
+ * Filter string format:
+ *
+ * ACTION SOURCE:RANGE_SPEC
+ * where ACTION is one of the
+ *  * "filter": limit the trace to this region
+ *  * "start": start tracing from this address
+ *  * "stop": stop tracing at this address/region;
+ * SOURCE is either "file" or "kernel"
+ * RANGE_SPEC is
+ *  * for "kernel": <start address>[/<size>]
+ *  * for "file":   <start address>[/<size>]@</path/to/object/file>
+ *
+ * if <size> is not specified, the range is treated as a single address.
+ */
+enum {
+	IF_ACT_FILTER,
+	IF_ACT_START,
+	IF_ACT_STOP,
+	IF_SRC_FILE,
+	IF_SRC_KERNEL,
+	IF_SRC_FILEADDR,
+	IF_SRC_KERNELADDR,
+};
+
+enum {
+	IF_STATE_ACTION = 0,
+	IF_STATE_SOURCE,
+	IF_STATE_END,
+};
+
+static const match_table_t if_tokens = {
+	{ IF_ACT_FILTER,	"filter" },
+	{ IF_ACT_START,		"start" },
+	{ IF_ACT_STOP,		"stop" },
+	{ IF_SRC_FILE,		"file:%u/%u@%s" },
+	{ IF_SRC_KERNEL,	"kernel:%u/%u" },
+	{ IF_SRC_FILEADDR,	"file:%u@%s" },
+	{ IF_SRC_KERNELADDR,	"kernel:%u" },
+};
+
+/*
+ * Itrace filter string parser
+ */
+static int
+perf_event_parse_itrace_filter(struct perf_event *event, char *fstr)
+{
+	struct perf_itrace_filter filter;
+	char *start, *orig, *filename = NULL;
+	struct path path;
+	substring_t args[MAX_OPT_ARGS];
+	int state = IF_STATE_ACTION, token;
+	int ret = -EINVAL;
+
+	orig = fstr = kstrdup(fstr, GFP_KERNEL);
+	if (!fstr)
+		return -ENOMEM;
+
+	while ((start = strsep(&fstr, " ,\n")) != NULL) {
+		ret = -EINVAL;
+
+		if (!*start)
+			continue;
+
+		/* filter definition begins */
+		if (state == IF_STATE_ACTION)
+			memset(&filter, 0, sizeof(filter));
+
+		token = match_token(start, if_tokens, args);
+		switch (token) {
+		case IF_ACT_FILTER:
+		case IF_ACT_START:
+			filter.filter = 1;
+
+		case IF_ACT_STOP:
+			if (state != IF_STATE_ACTION)
+				goto fail;
+
+			state = IF_STATE_SOURCE;
+			break;
+
+		case IF_SRC_KERNELADDR:
+		case IF_SRC_KERNEL:
+			filter.kernel = 1;
+
+		case IF_SRC_FILEADDR:
+		case IF_SRC_FILE:
+			if (state != IF_STATE_SOURCE)
+				goto fail;
+
+			if (token == IF_SRC_FILE || token == IF_SRC_KERNEL)
+				filter.range = 1;
+
+			*args[0].to = 0;
+			ret = kstrtoul(args[0].from, 0, &filter.offset);
+			if (ret)
+				goto fail;
+
+			if (filter.range) {
+				*args[1].to = 0;
+				ret = kstrtoul(args[1].from, 0, &filter.size);
+				if (ret)
+					goto fail;
+			}
+
+			if (token == IF_SRC_FILE) {
+				filename = match_strdup(&args[2]);
+				if (!filename) {
+					ret = -ENOMEM;
+					goto fail;
+				}
+			}
+
+			state = IF_STATE_END;
+			break;
+
+		default:
+			goto fail;
+		}
+
+		/*
+		 * Filter definition is fully parsed, validate and install it.
+		 * Make sure that it doesn't contradict itself or the event's
+		 * attribute.
+		 */
+		if (state == IF_STATE_END) {
+			if (filter.kernel && event->attr.exclude_kernel)
+				goto fail;
+
+			if (!filter.kernel) {
+				if (!filename)
+					goto fail;
+
+				/* look up the path and grab its inode */
+				ret = kern_path(filename, LOOKUP_FOLLOW, &path);
+				if (ret)
+					goto fail_free_name;
+
+				filter.inode = igrab(d_inode(path.dentry));
+				path_put(&path);
+				kfree(filename);
+				filename = NULL;
+			}
+
+			ret = perf_itrace_filter_insert(event, &filter,
+							event->ctx->task);
+			if (ret)
+				goto fail;
+
+			/* ready to consume more filters */
+			state = IF_STATE_ACTION;
+		}
+	}
+
+	if (state != IF_STATE_ACTION)
+		goto fail;
+
+	kfree(orig);
+
+	return 0;
+
+fail_free_name:
+	kfree(filename);
+fail:
+	perf_itrace_filters_clear(event);
+	kfree(orig);
+
+	return ret;
+}
+
+/*
+ * Filters are cloned in inherit_event() path to make sure child tracing is
+ * consistent with parent.
+ */
+static int
+perf_itrace_filters_clone(struct perf_event *to, struct perf_event *from,
+			  struct task_struct *task)
+{
+	struct perf_itrace_filter *filter;
+	int ret = -ENOMEM;
+
+	mutex_lock(&from->itrace_filters_mutex);
+	list_for_each_entry_rcu(filter, &from->itrace_filters, entry) {
+		/* parent's filter must hold a reference to this inode */
+		if (WARN_ON_ONCE(!igrab(filter->inode)))
+			goto fail;
+
+		ret = perf_itrace_filter_insert(to, filter, task);
+		if (ret) {
+			iput(filter->inode);
+			goto fail;
+		}
+	}
+
+	ret = 0;
+fail:
+	mutex_unlock(&from->itrace_filters_mutex);
+
+	if (!ret)
+		ret = perf_event_itrace_filters_setup(to);
+	else
+		perf_itrace_filters_clear(to);
+
+	return ret;
+}
+
+static int
+perf_event_set_itrace_filter(struct perf_event *event, char *filter_str)
+{
+	int ret = 0;
+
+	/*
+	 * Since this is called in perf_ioctl() path, we're already holding
+	 * ctx::mutex.
+	 */
+	lockdep_assert_held(&event->ctx->mutex);
+
+	/*
+	 * For now, we only support filtering in per-task events; doing so
+	 * for cpu-wide events requires additional context switching trickery,
+	 * since same object code will be mapped at different virtual
+	 * addresses in different processes.
+	 */
+	if (!event->ctx->task)
+		return -EOPNOTSUPP;
+
+	/* remove existing filters, if any */
+	perf_itrace_filters_clear(event);
+
+	ret = perf_event_parse_itrace_filter(event, filter_str);
+	if (!ret) {
+		perf_itrace_filters_apply(event);
+
+		ret = perf_event_itrace_filters_setup(event);
+		if (ret)
+			perf_itrace_filters_clear(event);
+	}
+
+	return ret;
+}
+
+static int perf_event_set_filter(struct perf_event *event, void __user *arg)
+{
+	char *filter_str;
+	int ret = -EINVAL;
+
+	if ((event->attr.type != PERF_TYPE_TRACEPOINT ||
+	    !IS_ENABLED(CONFIG_EVENT_TRACING)) &&
+	    !has_itrace_filter(event))
+		return -EINVAL;
+
+	filter_str = strndup_user(arg, PAGE_SIZE);
+	if (IS_ERR(filter_str))
+		return PTR_ERR(filter_str);
+
+	if (IS_ENABLED(CONFIG_EVENT_TRACING) &&
+	    event->attr.type == PERF_TYPE_TRACEPOINT)
+		ret = ftrace_profile_set_filter(event, event->attr.config,
+						filter_str);
+	else if (has_itrace_filter(event))
+		ret = perf_event_set_itrace_filter(event, filter_str);
+
+	kfree(filter_str);
+	return ret;
+}
 
 /*
  * hrtimer based swevent callback
@@ -7910,13 +8533,14 @@ perf_event_alloc(struct perf_event_attr *attr, int cpu,
 	INIT_LIST_HEAD(&event->sibling_list);
 	INIT_LIST_HEAD(&event->rb_entry);
 	INIT_LIST_HEAD(&event->active_entry);
+	INIT_LIST_HEAD(&event->itrace_filters);
 	INIT_HLIST_NODE(&event->hlist_entry);
-
 
 	init_waitqueue_head(&event->waitq);
 	init_irq_work(&event->pending, perf_pending_event);
 
 	mutex_init(&event->mmap_mutex);
+	mutex_init(&event->itrace_filters_mutex);
 
 	atomic_long_set(&event->refcount, 1);
 	event->cpu		= cpu;
@@ -8181,12 +8805,14 @@ perf_event_set_output(struct perf_event *event, struct perf_event *output_event)
 	if (output_event->clock != event->clock)
 		goto out;
 
+#if 0
 	/*
 	 * If both events generate aux data, they must be on the same PMU
 	 */
 	if (has_aux(event) && has_aux(output_event) &&
 	    event->pmu != output_event->pmu)
 		goto out;
+#endif
 
 set:
 	mutex_lock(&event->mmap_mutex);
@@ -9075,6 +9701,18 @@ inherit_event(struct perf_event *parent_event,
 	}
 
 	get_ctx(child_ctx);
+
+	/*
+	 * Clone itrace filters from the parent, if any
+	 */
+	if (has_itrace_filter(child_event)) {
+		if (perf_itrace_filters_clone(child_event, parent_event,
+					      child)) {
+			put_ctx(child_ctx);
+			free_event(child_event);
+			return NULL;
+		}
+	}
 
 	/*
 	 * Make the child state follow the state of the parent event,

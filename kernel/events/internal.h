@@ -28,7 +28,8 @@ struct ring_buffer {
 	local_t				lost;		/* nr records lost   */
 
 	long				watermark;	/* wakeup watermark  */
-	long				aux_watermark;
+	long				aux_watermark_pt;
+	long				aux_watermark_pebs;
 	/* poll crap */
 	spinlock_t			event_lock;
 	struct list_head		event_list;
@@ -38,18 +39,31 @@ struct ring_buffer {
 	struct user_struct		*mmap_user;
 
 	/* AUX area */
-	local_t				aux_head;
-	local_t				aux_nest;
-	local_t				aux_wakeup;
 	unsigned long			aux_pgoff;
-	int				aux_nr_pages;
-	int				aux_overwrite;
-	atomic_t			aux_mmap_count;
-	unsigned long			aux_mmap_locked;
-	void				(*free_aux)(void *);
-	atomic_t			aux_refcount;
-	void				**aux_pages;
-	void				*aux_priv;
+    //PT AUX AREA
+	local_t				aux_head_pt;
+	local_t				aux_nest_pt;
+	local_t				aux_wakeup_pt;
+	int				aux_nr_pages_pt;
+	int				aux_overwrite_pt;
+	atomic_t			aux_mmap_count_pt;
+	unsigned long			aux_mmap_locked_pt;
+	void				(*free_aux_pt)(void *);
+	atomic_t			aux_refcount_pt;
+	void				**aux_pages_pt;
+	void				*aux_priv_pt;
+    //PEBS AUX AREA
+	local_t				aux_head_pebs;
+	local_t				aux_nest_pebs;
+	local_t				aux_wakeup_pebs;
+	int				aux_nr_pages_pebs;
+	int				aux_overwrite_pebs;
+	atomic_t			aux_mmap_count_pebs;
+	unsigned long			aux_mmap_locked_pebs;
+	void				(*free_aux_pebs)(void *);
+	atomic_t			aux_refcount_pebs;
+	void				**aux_pages_pebs;
+	void				*aux_priv_pebs;
 
 	struct perf_event_mmap_page	*user_page;
 	void				*data_pages[0];
@@ -74,9 +88,13 @@ extern void rb_free_aux(struct ring_buffer *rb);
 extern struct ring_buffer *ring_buffer_get(struct perf_event *event);
 extern void ring_buffer_put(struct ring_buffer *rb);
 
-static inline bool rb_has_aux(struct ring_buffer *rb)
+static inline bool rb_has_aux_pt(struct ring_buffer *rb)
 {
-	return !!rb->aux_nr_pages;
+	return !!rb->aux_nr_pages_pt;
+}
+static inline bool rb_has_aux_pebs(struct ring_buffer *rb)
+{
+    return !!rb->aux_nr_pages_pebs;
 }
 
 void perf_event_aux_event(struct perf_event *event, unsigned long head,
@@ -110,10 +128,16 @@ static inline unsigned long perf_data_size(struct ring_buffer *rb)
 	return rb->nr_pages << (PAGE_SHIFT + page_order(rb));
 }
 
-static inline unsigned long perf_aux_size(struct ring_buffer *rb)
+static inline unsigned long perf_aux_size_pt(struct ring_buffer *rb)
 {
-	return rb->aux_nr_pages << PAGE_SHIFT;
+	return (rb->aux_nr_pages_pt << PAGE_SHIFT);
 }
+
+static inline unsigned long perf_aux_size_pebs(struct ring_buffer *rb)
+{
+	return (rb->aux_nr_pages_pebs << PAGE_SHIFT);
+}
+
 
 #define DEFINE_OUTPUT_COPY(func_name, memcpy_func)			\
 static inline unsigned long						\

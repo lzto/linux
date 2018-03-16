@@ -178,7 +178,9 @@ int perf_output_begin(struct perf_output_handle *handle,
 	handle->size = (1UL << page_shift) - offset;
 
 	if (unlikely(have_lost)) {
-		struct perf_sample_data sample_data;
+		struct perf_sample_data sample_data = {
+			.time = 0,
+		};
 
 		lost_event.header.size = sizeof(lost_event);
 		lost_event.header.type = PERF_RECORD_LOST;
@@ -255,6 +257,9 @@ static void ring_buffer_put_async(struct ring_buffer *rb)
 	irq_work_queue(&rb->irq_work);
 }
 
+//DIRTY HACK
+////////////////////////////////////////////////////////////////////////////////
+//FOR PT
 /*
  * This is called before hardware starts writing to the AUX area to
  * obtain an output handle and make sure there's room in the buffer.
@@ -265,7 +270,7 @@ static void ring_buffer_put_async(struct ring_buffer *rb)
  * the exception of (B), which should be taken care of by the pmu
  * driver, since ordering rules will differ depending on hardware.
  */
-void *perf_aux_output_begin(struct perf_output_handle *handle,
+void *perf_aux_output_begin_pt(struct perf_output_handle *handle,
 			    struct perf_event *event)
 {
 	struct perf_event *output_event = event;
@@ -284,17 +289,17 @@ void *perf_aux_output_begin(struct perf_output_handle *handle,
 	if (!rb)
 		return NULL;
 
-	if (!rb_has_aux(rb) || !atomic_inc_not_zero(&rb->aux_refcount))
+	if (!rb_has_aux_pt(rb) || !atomic_inc_not_zero(&rb->aux_refcount_pt))
 		goto err;
 
 	/*
 	 * Nesting is not supported for AUX area, make sure nested
 	 * writers are caught early
 	 */
-	if (WARN_ON_ONCE(local_xchg(&rb->aux_nest, 1)))
+	if (WARN_ON_ONCE(local_xchg(&rb->aux_nest_pt, 1)))
 		goto err_put;
 
-	aux_head = local_read(&rb->aux_head);
+	aux_head = local_read(&rb->aux_head_pt);
 
 	handle->rb = rb;
 	handle->event = event;
@@ -306,11 +311,11 @@ void *perf_aux_output_begin(struct perf_output_handle *handle,
 	 * therefore (A) control dependency barrier does not exist. The
 	 * (B) <-> (C) ordering is still observed by the pmu driver.
 	 */
-	if (!rb->aux_overwrite) {
-		aux_tail = ACCESS_ONCE(rb->user_page->aux_tail);
-		handle->wakeup = local_read(&rb->aux_wakeup) + rb->aux_watermark;
-		if (aux_head - aux_tail < perf_aux_size(rb))
-			handle->size = CIRC_SPACE(aux_head, aux_tail, perf_aux_size(rb));
+	if (!rb->aux_overwrite_pt) {
+		aux_tail = ACCESS_ONCE(rb->user_page->aux_tail_pt);
+		handle->wakeup = local_read(&rb->aux_wakeup_pt) + rb->aux_watermark_pt;
+		if (aux_head - aux_tail < perf_aux_size_pt(rb))
+			handle->size = CIRC_SPACE(aux_head, aux_tail, perf_aux_size_pt(rb));
 
 		/*
 		 * handle->size computation depends on aux_tail load; this forms a
@@ -320,12 +325,12 @@ void *perf_aux_output_begin(struct perf_output_handle *handle,
 		if (!handle->size) { /* A, matches D */
 			event->pending_disable = 1;
 			perf_output_wakeup(handle);
-			local_set(&rb->aux_nest, 0);
+			local_set(&rb->aux_nest_pt, 0);
 			goto err_put;
 		}
 	}
 
-	return handle->rb->aux_priv;
+	return handle->rb->aux_priv_pt;
 
 err_put:
 	rb_free_aux(rb);
@@ -343,7 +348,7 @@ err:
  * pmu driver's responsibility to observe ordering rules of the hardware,
  * so that all the data is externally visible before this is called.
  */
-void perf_aux_output_end(struct perf_output_handle *handle, unsigned long size,
+void perf_aux_output_end_pt(struct perf_output_handle *handle, unsigned long size,
 			 bool truncated)
 {
 	struct ring_buffer *rb = handle->rb;
@@ -354,14 +359,14 @@ void perf_aux_output_end(struct perf_output_handle *handle, unsigned long size,
 		flags |= PERF_AUX_FLAG_TRUNCATED;
 
 	/* in overwrite mode, driver provides aux_head via handle */
-	if (rb->aux_overwrite) {
+	if (rb->aux_overwrite_pt) {
 		flags |= PERF_AUX_FLAG_OVERWRITE;
 
 		aux_head = handle->head;
-		local_set(&rb->aux_head, aux_head);
+		local_set(&rb->aux_head_pt, aux_head);
 	} else {
-		aux_head = local_read(&rb->aux_head);
-		local_add(size, &rb->aux_head);
+		aux_head = local_read(&rb->aux_head_pt);
+		local_add(size, &rb->aux_head_pt);
 	}
 
 	if (size || flags) {
@@ -372,15 +377,15 @@ void perf_aux_output_end(struct perf_output_handle *handle, unsigned long size,
 		perf_event_aux_event(handle->event, aux_head, size, flags);
 	}
 
-	aux_head = rb->user_page->aux_head = local_read(&rb->aux_head);
+	aux_head = rb->user_page->aux_head_pt = local_read(&rb->aux_head_pt);
 
-	if (aux_head - local_read(&rb->aux_wakeup) >= rb->aux_watermark) {
+	if (aux_head - local_read(&rb->aux_wakeup_pt) >= rb->aux_watermark_pt) {
 		perf_output_wakeup(handle);
-		local_add(rb->aux_watermark, &rb->aux_wakeup);
+		local_add(rb->aux_watermark_pt, &rb->aux_wakeup_pt);
 	}
 	handle->event = NULL;
 
-	local_set(&rb->aux_nest, 0);
+	local_set(&rb->aux_nest_pt, 0);
 	rb_free_aux(rb);
 	ring_buffer_put_async(rb);
 }
@@ -389,7 +394,7 @@ void perf_aux_output_end(struct perf_output_handle *handle, unsigned long size,
  * Skip over a given number of bytes in the AUX buffer, due to, for example,
  * hardware's alignment constraints.
  */
-int perf_aux_output_skip(struct perf_output_handle *handle, unsigned long size)
+int perf_aux_output_skip_pt(struct perf_output_handle *handle, unsigned long size)
 {
 	struct ring_buffer *rb = handle->rb;
 	unsigned long aux_head;
@@ -397,14 +402,14 @@ int perf_aux_output_skip(struct perf_output_handle *handle, unsigned long size)
 	if (size > handle->size)
 		return -ENOSPC;
 
-	local_add(size, &rb->aux_head);
+	local_add(size, &rb->aux_head_pt);
 
-	aux_head = rb->user_page->aux_head = local_read(&rb->aux_head);
-	if (aux_head - local_read(&rb->aux_wakeup) >= rb->aux_watermark) {
+	aux_head = rb->user_page->aux_head_pt = local_read(&rb->aux_head_pt);
+	if (aux_head - local_read(&rb->aux_wakeup_pt) >= rb->aux_watermark_pt) {
 		perf_output_wakeup(handle);
-		local_add(rb->aux_watermark, &rb->aux_wakeup);
-		handle->wakeup = local_read(&rb->aux_wakeup) +
-				 rb->aux_watermark;
+		local_add(rb->aux_watermark_pt, &rb->aux_wakeup_pt);
+		handle->wakeup = local_read(&rb->aux_wakeup_pt) +
+				 rb->aux_watermark_pt;
 	}
 
 	handle->head = aux_head;
@@ -413,15 +418,183 @@ int perf_aux_output_skip(struct perf_output_handle *handle, unsigned long size)
 	return 0;
 }
 
-void *perf_get_aux(struct perf_output_handle *handle)
+
+////////////////////////////////////////////////////////////////////////////////
+//FOR PEBS
+/*
+ * This is called before hardware starts writing to the AUX area to
+ * obtain an output handle and make sure there's room in the buffer.
+ * When the capture completes, call perf_aux_output_end() to commit
+ * the recorded data to the buffer.
+ *
+ * The ordering is similar to that of perf_output_{begin,end}, with
+ * the exception of (B), which should be taken care of by the pmu
+ * driver, since ordering rules will differ depending on hardware.
+ */
+void *perf_aux_output_begin_pebs(struct perf_output_handle *handle,
+			    struct perf_event *event)
+{
+	struct perf_event *output_event = event;
+	unsigned long aux_head, aux_tail;
+	struct ring_buffer *rb;
+
+	if (output_event->parent)
+		output_event = output_event->parent;
+
+	/*
+	 * Since this will typically be open across pmu::add/pmu::del, we
+	 * grab ring_buffer's refcount instead of holding rcu read lock
+	 * to make sure it doesn't disappear under us.
+	 */
+	rb = ring_buffer_get(output_event);
+	if (!rb)
+		return NULL;
+
+	if (!rb_has_aux_pebs(rb) || !atomic_inc_not_zero(&rb->aux_refcount_pebs))
+		goto err;
+
+	/*
+	 * Nesting is not supported for AUX area, make sure nested
+	 * writers are caught early
+	 */
+	if (WARN_ON_ONCE(local_xchg(&rb->aux_nest_pebs, 1)))
+		goto err_put;
+
+	aux_head = local_read(&rb->aux_head_pebs);
+
+	handle->rb = rb;
+	handle->event = event;
+	handle->head = aux_head;
+	handle->size = 0;
+
+	/*
+	 * In overwrite mode, AUX data stores do not depend on aux_tail,
+	 * therefore (A) control dependency barrier does not exist. The
+	 * (B) <-> (C) ordering is still observed by the pmu driver.
+	 */
+	if (!rb->aux_overwrite_pebs) {
+		aux_tail = ACCESS_ONCE(rb->user_page->aux_tail_pebs);
+		handle->wakeup = local_read(&rb->aux_wakeup_pebs) + rb->aux_watermark_pebs;
+		if (aux_head - aux_tail < perf_aux_size_pebs(rb))
+			handle->size = CIRC_SPACE(aux_head, aux_tail, perf_aux_size_pebs(rb));
+
+		/*
+		 * handle->size computation depends on aux_tail load; this forms a
+		 * control dependency barrier separating aux_tail load from aux data
+		 * store that will be enabled on successful return
+		 */
+		if (!handle->size) { /* A, matches D */
+			event->pending_disable = 1;
+			perf_output_wakeup(handle);
+			local_set(&rb->aux_nest_pebs, 0);
+			goto err_put;
+		}
+	}
+
+	return handle->rb->aux_priv_pebs;
+
+err_put:
+	rb_free_aux(rb);
+
+err:
+	ring_buffer_put_async(rb);
+	handle->event = NULL;
+
+	return NULL;
+}
+
+/*
+ * Commit the data written by hardware into the ring buffer by adjusting
+ * aux_head and posting a PERF_RECORD_AUX into the perf buffer. It is the
+ * pmu driver's responsibility to observe ordering rules of the hardware,
+ * so that all the data is externally visible before this is called.
+ */
+void perf_aux_output_end_pebs(struct perf_output_handle *handle, unsigned long size,
+			 bool truncated)
+{
+	struct ring_buffer *rb = handle->rb;
+	unsigned long aux_head;
+	u64 flags = 0;
+
+	if (truncated)
+		flags |= PERF_AUX_FLAG_TRUNCATED;
+
+	/* in overwrite mode, driver provides aux_head via handle */
+	if (rb->aux_overwrite_pebs) {
+		flags |= PERF_AUX_FLAG_OVERWRITE;
+
+		aux_head = handle->head;
+		local_set(&rb->aux_head_pebs, aux_head);
+	} else {
+		aux_head = local_read(&rb->aux_head_pebs);
+		local_add(size, &rb->aux_head_pebs);
+	}
+
+	if (size || flags) {
+		/*
+		 * Only send RECORD_AUX if we have something useful to communicate
+		 */
+		perf_event_aux_event(handle->event, aux_head, size, flags);
+	}
+    
+	aux_head = rb->user_page->aux_head_pebs = local_read(&rb->aux_head_pebs);
+	if (aux_head - local_read(&rb->aux_wakeup_pebs) >= rb->aux_watermark_pebs) {
+		perf_output_wakeup(handle);
+		local_add(rb->aux_watermark_pebs, &rb->aux_wakeup_pebs);
+	}
+	handle->event = NULL;
+
+	local_set(&rb->aux_nest_pebs, 0);
+	rb_free_aux(rb);
+	ring_buffer_put_async(rb);
+}
+
+/*
+ * Skip over a given number of bytes in the AUX buffer, due to, for example,
+ * hardware's alignment constraints.
+ */
+int perf_aux_output_skip_pebs(struct perf_output_handle *handle, unsigned long size)
+{
+	struct ring_buffer *rb = handle->rb;
+	unsigned long aux_head;
+
+	if (size > handle->size)
+		return -ENOSPC;
+
+	local_add(size, &rb->aux_head_pebs);
+
+	aux_head = rb->user_page->aux_head_pebs = local_read(&rb->aux_head_pebs);
+
+	if (aux_head - local_read(&rb->aux_wakeup_pebs) >= rb->aux_watermark_pebs) {
+		perf_output_wakeup(handle);
+		local_add(rb->aux_watermark_pebs, &rb->aux_wakeup_pebs);
+		handle->wakeup = local_read(&rb->aux_wakeup_pebs) +
+				 rb->aux_watermark_pebs;
+	}
+
+	handle->head = aux_head;
+	handle->size -= size;
+
+	return 0;
+}
+////////////////////////////////////////////////////////////////////////////////
+void *perf_get_aux_pt(struct perf_output_handle *handle)
 {
 	/* this is only valid between perf_aux_output_begin and *_end */
 	if (!handle->event)
 		return NULL;
 
-	return handle->rb->aux_priv;
+	return handle->rb->aux_priv_pt;
 }
 
+void *perf_get_aux_pebs(struct perf_output_handle *handle)
+{
+	/* this is only valid between perf_aux_output_begin and *_end */
+	if (!handle->event)
+		return NULL;
+
+	return handle->rb->aux_priv_pebs;
+}
 #define PERF_AUX_GFP	(GFP_KERNEL | __GFP_ZERO | __GFP_NOWARN | __GFP_NORETRY)
 
 static struct page *rb_alloc_aux_page(int node, int order)
@@ -450,9 +623,18 @@ static struct page *rb_alloc_aux_page(int node, int order)
 	return page;
 }
 
-static void rb_free_aux_page(struct ring_buffer *rb, int idx)
+static void rb_free_aux_page_pt(struct ring_buffer *rb, int idx)
 {
-	struct page *page = virt_to_page(rb->aux_pages[idx]);
+	struct page *page = virt_to_page(rb->aux_pages_pt[idx]);
+
+	ClearPagePrivate(page);
+	page->mapping = NULL;
+	__free_page(page);
+}
+
+static void rb_free_aux_page_pebs(struct ring_buffer *rb, int idx)
+{
+	struct page *page = virt_to_page(rb->aux_pages_pebs[idx]);
 
 	ClearPagePrivate(page);
 	page->mapping = NULL;
@@ -462,21 +644,39 @@ static void rb_free_aux_page(struct ring_buffer *rb, int idx)
 static void __rb_free_aux(struct ring_buffer *rb)
 {
 	int pg;
+    //PT
+	if (rb->aux_priv_pt) {
+		rb->free_aux_pt(rb->aux_priv_pt);
+		rb->free_aux_pt = NULL;
+		rb->aux_priv_pt = NULL;
+	}
+	if (rb->aux_nr_pages_pt) {
+		for (pg = 0; pg < rb->aux_nr_pages_pt; pg++)
+			rb_free_aux_page_pt(rb, pg);
 
-	if (rb->aux_priv) {
-		rb->free_aux(rb->aux_priv);
-		rb->free_aux = NULL;
-		rb->aux_priv = NULL;
+		kfree(rb->aux_pages_pt);
+		rb->aux_nr_pages_pt = 0;
 	}
 
-	if (rb->aux_nr_pages) {
-		for (pg = 0; pg < rb->aux_nr_pages; pg++)
-			rb_free_aux_page(rb, pg);
+    //PEBS
+	if (rb->aux_priv_pebs) {
+		rb->free_aux_pebs(rb->aux_priv_pebs);
+		rb->free_aux_pebs = NULL;
+		rb->aux_priv_pebs = NULL;
+	}
 
-		kfree(rb->aux_pages);
-		rb->aux_nr_pages = 0;
+	if (rb->aux_nr_pages_pebs) {
+		for (pg = 0; pg < rb->aux_nr_pages_pebs; pg++)
+			rb_free_aux_page_pebs(rb, pg);
+
+		kfree(rb->aux_pages_pebs);
+		rb->aux_nr_pages_pebs = 0;
 	}
 }
+void pt_buffer_free_aux(void* data);
+void* pt_buffer_setup_aux(int cpu, void **pages, int nr_pages, bool overwrite);
+void pebs_buffer_free_aux(void* data);
+void* pebs_buffer_setup_aux(int cpu, void **pages, int nr_pages, bool overwrite);
 
 int rb_alloc_aux(struct ring_buffer *rb, struct perf_event *event,
 		 pgoff_t pgoff, int nr_pages, long watermark, int flags)
@@ -487,7 +687,8 @@ int rb_alloc_aux(struct ring_buffer *rb, struct perf_event *event,
 
 	if (!has_aux(event))
 		return -ENOTSUPP;
-
+    //assume NO_SG and SW_DOUBLEBUF for pt
+#if 0
 	if (event->pmu->capabilities & PERF_PMU_CAP_AUX_NO_SG) {
 		/*
 		 * We need to start with the max_order that fits in nr_pages,
@@ -507,24 +708,52 @@ int rb_alloc_aux(struct ring_buffer *rb, struct perf_event *event,
 			max_order--;
 		}
 	}
+#endif
 
-	rb->aux_pages = kzalloc_node(nr_pages * sizeof(void *), GFP_KERNEL, node);
-	if (!rb->aux_pages)
+	rb->aux_pages_pt = kzalloc_node(nr_pages / 2 * sizeof(void *), GFP_KERNEL, node);
+	if (!rb->aux_pages_pt)
 		return -ENOMEM;
 
-	rb->free_aux = event->pmu->free_aux;
-	for (rb->aux_nr_pages = 0; rb->aux_nr_pages < nr_pages;) {
+	rb->aux_pages_pebs = kzalloc_node(nr_pages / 2 * sizeof(void *), GFP_KERNEL, node);
+	if (!rb->aux_pages_pebs)
+		return -ENOMEM;
+
+    //FIXME pt for pt pebs for pebs
+	//rb->free_aux_pt = event->pmu->free_aux;
+	//rb->free_aux_pebs = event->pmu->free_aux;
+    rb->free_aux_pt = &pt_buffer_free_aux;
+    rb->free_aux_pebs = &pebs_buffer_free_aux;
+
+    //allocate aux page for pt
+	for (rb->aux_nr_pages_pt = 0; rb->aux_nr_pages_pt < nr_pages/2;) {
 		struct page *page;
 		int last, order;
 
-		order = min(max_order, ilog2(nr_pages - rb->aux_nr_pages));
+		order = min(max_order, ilog2(nr_pages/2 - rb->aux_nr_pages_pt));
 		page = rb_alloc_aux_page(node, order);
 		if (!page)
 			goto out;
 
-		for (last = rb->aux_nr_pages + (1 << page_private(page));
-		     last > rb->aux_nr_pages; rb->aux_nr_pages++)
-			rb->aux_pages[rb->aux_nr_pages] = page_address(page++);
+		for (last = rb->aux_nr_pages_pt + (1 << page_private(page));
+		     last > rb->aux_nr_pages_pt; rb->aux_nr_pages_pt++)
+			rb->aux_pages_pt[rb->aux_nr_pages_pt] = page_address(page++);
+	}
+
+    //assume NO_SG and DOUBLEBUF for pebs
+    max_order = ilog2(nr_pages/2) - 1;
+    //allocate aux page for pebs
+	for (rb->aux_nr_pages_pebs = 0; rb->aux_nr_pages_pebs < nr_pages/2;) {
+		struct page *page;
+		int last, order;
+
+		order = min(max_order, ilog2(nr_pages/2 - rb->aux_nr_pages_pebs));
+		page = rb_alloc_aux_page(node, order);
+		if (!page)
+			goto out;
+
+		for (last = rb->aux_nr_pages_pebs + (1 << page_private(page));
+		     last > rb->aux_nr_pages_pebs; rb->aux_nr_pages_pebs++)
+			rb->aux_pages_pebs[rb->aux_nr_pages_pebs] = page_address(page++);
 	}
 
 	/*
@@ -533,6 +762,8 @@ int rb_alloc_aux(struct ring_buffer *rb, struct perf_event *event,
 	 * buffering. In this case, the entire buffer has to be one contiguous
 	 * chunk.
 	 */
+    #if 0
+    //DO NOT SUPPORT OVERWRITE FOR NOW
 	if ((event->pmu->capabilities & PERF_PMU_CAP_AUX_NO_SG) &&
 	    overwrite) {
 		struct page *page = virt_to_page(rb->aux_pages[0]);
@@ -540,11 +771,28 @@ int rb_alloc_aux(struct ring_buffer *rb, struct perf_event *event,
 		if (page_private(page) != max_order)
 			goto out;
 	}
-
-	rb->aux_priv = event->pmu->setup_aux(event->cpu, rb->aux_pages, nr_pages,
-					     overwrite);
-	if (!rb->aux_priv)
+    #endif
+    //FIXME pt for pt pebs for pebs
+	//rb->aux_priv_pt = event->pmu->setup_aux(event->cpu, rb->aux_pages_pt, nr_pages/2,
+	//				     overwrite);
+    rb->aux_priv_pt = pt_buffer_setup_aux(
+                        event->cpu,
+                        rb->aux_pages_pt,
+                        nr_pages/2,
+                        overwrite);
+	if (!rb->aux_priv_pt)
 		goto out;
+
+	//rb->aux_priv_pebs = event->pmu->setup_aux(event->cpu, rb->aux_pages_pebs, nr_pages/2,
+	//				     overwrite);
+    rb->aux_priv_pebs = pebs_buffer_setup_aux(
+                        event->cpu,
+                        rb->aux_pages_pebs,
+                        nr_pages/2,
+                        overwrite);
+	if (!rb->aux_priv_pebs)
+		goto out;
+
 
 	ret = 0;
 
@@ -554,13 +802,24 @@ int rb_alloc_aux(struct ring_buffer *rb, struct perf_event *event,
 	 * we keep a refcount here to make sure either of the two can
 	 * reference them safely.
 	 */
-	atomic_set(&rb->aux_refcount, 1);
+	atomic_set(&rb->aux_refcount_pt, 1);
+	atomic_set(&rb->aux_refcount_pebs, 1);
 
-	rb->aux_overwrite = overwrite;
-	rb->aux_watermark = watermark;
+	rb->aux_overwrite_pt = overwrite;
+	rb->aux_overwrite_pebs = overwrite;
 
-	if (!rb->aux_watermark && !rb->aux_overwrite)
-		rb->aux_watermark = nr_pages << (PAGE_SHIFT - 1);
+	rb->aux_watermark_pt = watermark/2;
+    //FIXME! should have an offset??
+	rb->aux_watermark_pebs = watermark/2;
+
+	if (!rb->aux_watermark_pt && !rb->aux_overwrite_pt)
+    {
+		rb->aux_watermark_pt = ((nr_pages/2) << (PAGE_SHIFT - 2));
+    }
+	if (!rb->aux_watermark_pebs && !rb->aux_overwrite_pebs)
+    {
+		rb->aux_watermark_pebs = ((nr_pages/2) << (PAGE_SHIFT - 2)) ;
+    }
 
 out:
 	if (!ret)
@@ -573,7 +832,8 @@ out:
 
 void rb_free_aux(struct ring_buffer *rb)
 {
-	if (atomic_dec_and_test(&rb->aux_refcount))
+	if (atomic_dec_and_test(&rb->aux_refcount_pt) && 
+        atomic_dec_and_test(&rb->aux_refcount_pebs))
 		irq_work_queue(&rb->irq_work);
 }
 
@@ -581,7 +841,8 @@ static void rb_irq_work(struct irq_work *work)
 {
 	struct ring_buffer *rb = container_of(work, struct ring_buffer, irq_work);
 
-	if (!atomic_read(&rb->aux_refcount))
+	if ((!atomic_read(&rb->aux_refcount_pt))
+        &&(!atomic_read(&rb->aux_refcount_pebs)))
 		__rb_free_aux(rb);
 
 	if (rb->rcu_head.next == (void *)rb)
@@ -765,14 +1026,17 @@ fail:
 struct page *
 perf_mmap_to_page(struct ring_buffer *rb, unsigned long pgoff)
 {
-	if (rb->aux_nr_pages) {
+	if ((rb->aux_nr_pages_pt + rb->aux_nr_pages_pebs)!=0) {
 		/* above AUX space */
-		if (pgoff > rb->aux_pgoff + rb->aux_nr_pages)
+		if (pgoff > (rb->aux_pgoff + rb->aux_nr_pages_pt + rb->aux_nr_pages_pebs))
 			return NULL;
 
-		/* AUX space */
-		if (pgoff >= rb->aux_pgoff)
-			return virt_to_page(rb->aux_pages[pgoff - rb->aux_pgoff]);
+		/* AUX space for pebs*/
+		if (pgoff >= rb->aux_pgoff + rb->aux_nr_pages_pt)
+			return virt_to_page(rb->aux_pages_pebs[pgoff - rb->aux_pgoff - rb->aux_nr_pages_pt]);
+        /* AUX space for pt*/
+        if (pgoff >= rb->aux_pgoff)
+            return virt_to_page(rb->aux_pages_pt[pgoff - rb->aux_pgoff]);
 	}
 
 	return __perf_mmap_to_page(rb, pgoff);

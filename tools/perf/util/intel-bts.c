@@ -597,7 +597,7 @@ static int intel_bts_process_event(struct perf_session *session,
 				   struct perf_sample *sample,
 				   struct perf_tool *tool)
 {
-	struct intel_bts *bts = container_of(session->auxtrace, struct intel_bts,
+	struct intel_bts *bts = container_of(session->auxtrace_bts, struct intel_bts,
 					     auxtrace);
 	u64 timestamp;
 	int err;
@@ -640,7 +640,7 @@ static int intel_bts_process_auxtrace_event(struct perf_session *session,
 					    union perf_event *event,
 					    struct perf_tool *tool __maybe_unused)
 {
-	struct intel_bts *bts = container_of(session->auxtrace, struct intel_bts,
+	struct intel_bts *bts = container_of(session->auxtrace_bts, struct intel_bts,
 					     auxtrace);
 
 	if (bts->sampling_mode)
@@ -681,7 +681,7 @@ static int intel_bts_process_auxtrace_event(struct perf_session *session,
 static int intel_bts_flush(struct perf_session *session __maybe_unused,
 			   struct perf_tool *tool __maybe_unused)
 {
-	struct intel_bts *bts = container_of(session->auxtrace, struct intel_bts,
+	struct intel_bts *bts = container_of(session->auxtrace_bts, struct intel_bts,
 					     auxtrace);
 	int ret;
 
@@ -709,7 +709,7 @@ static void intel_bts_free_queue(void *priv)
 
 static void intel_bts_free_events(struct perf_session *session)
 {
-	struct intel_bts *bts = container_of(session->auxtrace, struct intel_bts,
+	struct intel_bts *bts = container_of(session->auxtrace_bts, struct intel_bts,
 					     auxtrace);
 	struct auxtrace_queues *queues = &bts->queues;
 	unsigned int i;
@@ -723,12 +723,12 @@ static void intel_bts_free_events(struct perf_session *session)
 
 static void intel_bts_free(struct perf_session *session)
 {
-	struct intel_bts *bts = container_of(session->auxtrace, struct intel_bts,
+	struct intel_bts *bts = container_of(session->auxtrace_bts, struct intel_bts,
 					     auxtrace);
 
 	auxtrace_heap__free(&bts->heap);
 	intel_bts_free_events(session);
-	session->auxtrace = NULL;
+	session->auxtrace_bts = NULL;
 	free(bts);
 }
 
@@ -891,7 +891,7 @@ int intel_bts_process_auxtrace_info(union perf_event *event,
 	bts->auxtrace.flush_events = intel_bts_flush;
 	bts->auxtrace.free_events = intel_bts_free_events;
 	bts->auxtrace.free = intel_bts_free;
-	session->auxtrace = &bts->auxtrace;
+	session->auxtrace_bts = &bts->auxtrace;
 
 	intel_bts_print_info(&auxtrace_info->priv[0], INTEL_BTS_PMU_TYPE,
 			     INTEL_BTS_SNAPSHOT_MODE);
@@ -926,7 +926,7 @@ int intel_bts_process_auxtrace_info(union perf_event *event,
 
 err_free_queues:
 	auxtrace_queues__free(&bts->queues);
-	session->auxtrace = NULL;
+	session->auxtrace_bts = NULL;
 err_free:
 	free(bts);
 	return err;

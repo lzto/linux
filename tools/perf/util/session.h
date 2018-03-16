@@ -22,7 +22,9 @@ struct perf_session {
 	struct perf_header	header;
 	struct machines		machines;
 	struct perf_evlist	*evlist;
-	struct auxtrace		*auxtrace;
+	struct auxtrace		*auxtrace_pt;
+	struct auxtrace		*auxtrace_pebs;
+	struct auxtrace		*auxtrace_bts;
 	struct itrace_synth_opts *itrace_synth_opts;
 	struct list_head	auxtrace_index;
 	struct trace_event	tevent;

@@ -750,7 +750,9 @@ union perf_event *perf_evlist__mmap_read(struct perf_evlist *evlist, int idx)
 
 static bool perf_mmap__empty(struct perf_mmap *md)
 {
-	return perf_mmap__read_head(md) == md->prev && !md->auxtrace_mmap.base;
+	return perf_mmap__read_head(md) == md->prev
+        && !md->auxtrace_mmap_pt.base
+        && !md->auxtrace_mmap_pebs.base;
 }
 
 static void perf_evlist__mmap_get(struct perf_evlist *evlist, int idx)
@@ -780,8 +782,10 @@ void perf_evlist__mmap_consume(struct perf_evlist *evlist, int idx)
 		perf_evlist__mmap_put(evlist, idx);
 }
 
-int __weak auxtrace_mmap__mmap(struct auxtrace_mmap *mm __maybe_unused,
-			       struct auxtrace_mmap_params *mp __maybe_unused,
+int __weak auxtrace_mmap__mmap(struct auxtrace_mmap *mm_pt __maybe_unused,
+                    struct auxtrace_mmap *mm_pebs __maybe_unused,
+			       struct auxtrace_mmap_params *mp_pt __maybe_unused,
+			       struct auxtrace_mmap_params *mp_pebs __maybe_unused,
 			       void *userpg __maybe_unused,
 			       int fd __maybe_unused)
 {
@@ -815,7 +819,8 @@ static void __perf_evlist__munmap(struct perf_evlist *evlist, int idx)
 		evlist->mmap[idx].base = NULL;
 		atomic_set(&evlist->mmap[idx].refcnt, 0);
 	}
-	auxtrace_mmap__munmap(&evlist->mmap[idx].auxtrace_mmap);
+	auxtrace_mmap__munmap(&evlist->mmap[idx].auxtrace_mmap_pt);
+	auxtrace_mmap__munmap(&evlist->mmap[idx].auxtrace_mmap_pebs);
 }
 
 void perf_evlist__munmap(struct perf_evlist *evlist)
@@ -847,7 +852,9 @@ struct mmap_params {
 };
 
 static int __perf_evlist__mmap(struct perf_evlist *evlist, int idx,
-			       struct mmap_params *mp, int fd)
+			       struct mmap_params *mp_pt, 
+                   struct mmap_params *mp_pebs,
+                   int fd)
 {
 	/*
 	 * The last one will be done at perf_evlist__mmap_consume(), so that we
@@ -864,8 +871,8 @@ static int __perf_evlist__mmap(struct perf_evlist *evlist, int idx,
 	 */
 	atomic_set(&evlist->mmap[idx].refcnt, 2);
 	evlist->mmap[idx].prev = 0;
-	evlist->mmap[idx].mask = mp->mask;
-	evlist->mmap[idx].base = mmap(NULL, evlist->mmap_len, mp->prot,
+	evlist->mmap[idx].mask = mp_pt->mask;
+	evlist->mmap[idx].base = mmap(NULL, evlist->mmap_len, mp_pt->prot,
 				      MAP_SHARED, fd, 0);
 	if (evlist->mmap[idx].base == MAP_FAILED) {
 		pr_debug2("failed to mmap perf event ring buffer, error %d\n",
@@ -874,15 +881,20 @@ static int __perf_evlist__mmap(struct perf_evlist *evlist, int idx,
 		return -1;
 	}
 
-	if (auxtrace_mmap__mmap(&evlist->mmap[idx].auxtrace_mmap,
-				&mp->auxtrace_mp, evlist->mmap[idx].base, fd))
+	if (auxtrace_mmap__mmap(&evlist->mmap[idx].auxtrace_mmap_pt,
+                &evlist->mmap[idx].auxtrace_mmap_pebs,
+				&mp_pt->auxtrace_mp,
+				&mp_pebs->auxtrace_mp,
+                evlist->mmap[idx].base, fd))
 		return -1;
 
 	return 0;
 }
 
 static int perf_evlist__mmap_per_evsel(struct perf_evlist *evlist, int idx,
-				       struct mmap_params *mp, int cpu,
+				       struct mmap_params *mp_pt,
+                       struct mmap_params *mp_pebs,
+                       int cpu,
 				       int thread, int *output)
 {
 	struct perf_evsel *evsel;
@@ -894,10 +906,9 @@ static int perf_evlist__mmap_per_evsel(struct perf_evlist *evlist, int idx,
 			continue;
 
 		fd = FD(evsel, cpu, thread);
-
 		if (*output == -1) {
 			*output = fd;
-			if (__perf_evlist__mmap(evlist, idx, mp, *output) < 0)
+			if (__perf_evlist__mmap(evlist, idx, mp_pt, mp_pebs, *output) < 0)
 				return -1;
 		} else {
 			if (ioctl(fd, PERF_EVENT_IOC_SET_OUTPUT, *output) != 0)
@@ -905,7 +916,6 @@ static int perf_evlist__mmap_per_evsel(struct perf_evlist *evlist, int idx,
 
 			perf_evlist__mmap_get(evlist, idx);
 		}
-
 		/*
 		 * The system_wide flag causes a selected event to be opened
 		 * always without a pid.  Consequently it will never get a
@@ -932,21 +942,23 @@ static int perf_evlist__mmap_per_evsel(struct perf_evlist *evlist, int idx,
 }
 
 static int perf_evlist__mmap_per_cpu(struct perf_evlist *evlist,
-				     struct mmap_params *mp)
+				     struct mmap_params *mp_pt,
+                     struct mmap_params *mp_pebs)
 {
 	int cpu, thread;
 	int nr_cpus = cpu_map__nr(evlist->cpus);
 	int nr_threads = thread_map__nr(evlist->threads);
 
-	pr_debug2("perf event ring buffer mmapped per cpu\n");
+    pr_debug2("perf event ring buffer mmapped per cpu\n");
 	for (cpu = 0; cpu < nr_cpus; cpu++) {
 		int output = -1;
-
-		auxtrace_mmap_params__set_idx(&mp->auxtrace_mp, evlist, cpu,
+		auxtrace_mmap_params__set_idx(&mp_pt->auxtrace_mp, evlist, cpu,
+					      true);
+		auxtrace_mmap_params__set_idx(&mp_pebs->auxtrace_mp, evlist, cpu,
 					      true);
 
 		for (thread = 0; thread < nr_threads; thread++) {
-			if (perf_evlist__mmap_per_evsel(evlist, cpu, mp, cpu,
+			if (perf_evlist__mmap_per_evsel(evlist, cpu, mp_pt, mp_pebs, cpu,
 							thread, &output))
 				goto out_unmap;
 		}
@@ -961,7 +973,8 @@ out_unmap:
 }
 
 static int perf_evlist__mmap_per_thread(struct perf_evlist *evlist,
-					struct mmap_params *mp)
+					struct mmap_params *mp_pt,
+                    struct mmap_params *mp_pebs)
 {
 	int thread;
 	int nr_threads = thread_map__nr(evlist->threads);
@@ -970,10 +983,12 @@ static int perf_evlist__mmap_per_thread(struct perf_evlist *evlist,
 	for (thread = 0; thread < nr_threads; thread++) {
 		int output = -1;
 
-		auxtrace_mmap_params__set_idx(&mp->auxtrace_mp, evlist, thread,
+		auxtrace_mmap_params__set_idx(&mp_pt->auxtrace_mp, evlist, thread,
+					      false);
+		auxtrace_mmap_params__set_idx(&mp_pebs->auxtrace_mp, evlist, thread,
 					      false);
 
-		if (perf_evlist__mmap_per_evsel(evlist, thread, mp, 0, thread,
+		if (perf_evlist__mmap_per_evsel(evlist, thread, mp_pt, mp_pebs, 0, thread,
 						&output))
 			goto out_unmap;
 	}
@@ -1103,7 +1118,11 @@ int perf_evlist__mmap_ex(struct perf_evlist *evlist, unsigned int pages,
 	struct perf_evsel *evsel;
 	const struct cpu_map *cpus = evlist->cpus;
 	const struct thread_map *threads = evlist->threads;
-	struct mmap_params mp = {
+    //share these pages between pt and pebs
+	struct mmap_params mp_pt = {
+		.prot = PROT_READ | (overwrite ? 0 : PROT_WRITE),
+	};
+	struct mmap_params mp_pebs = {
 		.prot = PROT_READ | (overwrite ? 0 : PROT_WRITE),
 	};
 
@@ -1115,11 +1134,17 @@ int perf_evlist__mmap_ex(struct perf_evlist *evlist, unsigned int pages,
 
 	evlist->overwrite = overwrite;
 	evlist->mmap_len = perf_evlist__mmap_size(pages);
-	pr_debug("mmap size %zuB\n", evlist->mmap_len);
-	mp.mask = evlist->mmap_len - page_size - 1;
+	pr_debug("mmap size %zuB, auxtrace_pages:%d\n", evlist->mmap_len, auxtrace_pages);
 
-	auxtrace_mmap_params__init(&mp.auxtrace_mp, evlist->mmap_len,
-				   auxtrace_pages, auxtrace_overwrite);
+	mp_pt.mask = evlist->mmap_len - page_size - 1;
+	mp_pebs.mask = evlist->mmap_len + auxtrace_pages / 2 * (size_t)page_size - page_size - 1;
+
+ 	auxtrace_mmap_params__init(&mp_pebs.auxtrace_mp,
+                   evlist->mmap_len + auxtrace_pages/2 * (size_t)page_size,
+				   auxtrace_pages/2, auxtrace_overwrite);
+
+	auxtrace_mmap_params__init(&mp_pt.auxtrace_mp, evlist->mmap_len,
+				   auxtrace_pages/2, auxtrace_overwrite);
 
 	evlist__for_each(evlist, evsel) {
 		if ((evsel->attr.read_format & PERF_FORMAT_ID) &&
@@ -1129,9 +1154,11 @@ int perf_evlist__mmap_ex(struct perf_evlist *evlist, unsigned int pages,
 	}
 
 	if (cpu_map__empty(cpus))
-		return perf_evlist__mmap_per_thread(evlist, &mp);
+    {
+		return perf_evlist__mmap_per_thread(evlist, &mp_pt, &mp_pebs);
+    }
 
-	return perf_evlist__mmap_per_cpu(evlist, &mp);
+	return perf_evlist__mmap_per_cpu(evlist, &mp_pt, &mp_pebs);
 }
 
 int perf_evlist__mmap(struct perf_evlist *evlist, unsigned int pages,
@@ -1584,6 +1611,8 @@ out_close_ready_pipe:
 
 int perf_evlist__start_workload(struct perf_evlist *evlist)
 {
+    pr_debug("perf_evlist__start_workload cork_fd:%d\n",
+        evlist->workload.cork_fd);
 	if (evlist->workload.cork_fd > 0) {
 		char bf = 0;
 		int ret;

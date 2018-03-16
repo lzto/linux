@@ -132,6 +132,11 @@ void event_format__fprintf(struct event_format *event,
 void event_format__print(struct event_format *event,
 			 int cpu, void *data, int size)
 {
+    if (event==NULL)
+    {
+        fprintf(stderr,"BUG:event_format__print: event_format is NULL!!!\n");
+        return;
+    }
 	return event_format__fprintf(event, cpu, data, size, stdout);
 }
 
