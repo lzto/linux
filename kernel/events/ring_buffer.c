@@ -740,7 +740,10 @@ int rb_alloc_aux(struct ring_buffer *rb, struct perf_event *event,
 	}
 
     //assume NO_SG and DOUBLEBUF for pebs
-    max_order = ilog2(nr_pages/2) - 1;
+    //max_order = ilog2(nr_pages/2) - 1;
+
+    //modified for sampler to use single buffer
+    max_order = ilog2(nr_pages/2);
     //allocate aux page for pebs
 	for (rb->aux_nr_pages_pebs = 0; rb->aux_nr_pages_pebs < nr_pages/2;) {
 		struct page *page;
