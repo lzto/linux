@@ -405,7 +405,8 @@ static void pebs_event_start(struct perf_event *event, int flags)
     if (event->group_leader!=event)
     {
         //only group leader is allowed to start the group
-        x86_pmu_enable(event->pmu);
+        //x86_pmu_enable(event->pmu);
+        x86_pmu.enable(event);
         //perf_event_update_userpage(event);
         return;
     }
