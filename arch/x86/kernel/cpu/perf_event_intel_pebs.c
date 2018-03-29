@@ -27,6 +27,8 @@ extern void x86_pmu_disable(struct pmu*);
 extern void x86_add_intel_pebs_usage(void);
 extern void x86_del_intel_pebs_usage(void);
 
+extern void x86_release_hardware(void);
+
 extern const struct attribute_group *x86_pmu_attr_groups[];
 ////////////////////
 
@@ -39,7 +41,7 @@ struct pebs_ctx {
 	int started;
 	int valid;//is the ds backup valid?
     int aux_started;//already requested aux_begin
-    int added_event;
+    int added_event;//how many counters are used
 }__attribute__((aligned(sizeof(u64))));
 
 static DEFINE_PER_CPU(struct pebs_ctx, pebs_ctx);
@@ -381,11 +383,31 @@ static void pebs_event_start(struct perf_event *event, int flags)
 {
 	struct pebs_ctx *pebs = this_cpu_ptr(&pebs_ctx);
 	struct pebs_buffer *buf = perf_get_aux_pebs(&pebs->handle);
+    struct cpu_hw_events *cpuc = this_cpu_ptr(&cpu_hw_events);
+    int idx = event->hw.idx;
 
-	if (!buf)
+    if (!buf)
     {
         WARN(1, "pebs_event_start get aux buffer null???\n");
 		return;
+    }
+    
+    if (!(event->hw.state & PERF_HES_STOPPED))
+        return;
+    if (idx==-1)
+        return;
+
+    event->hw.state = 0;
+    cpuc->events[idx] = event;
+    __set_bit(idx, cpuc->active_mask);
+    __set_bit(idx, cpuc->running);
+
+    if (event->group_leader!=event)
+    {
+        //only group leader is allowed to start the group
+        x86_pmu_enable(event->pmu);
+        //perf_event_update_userpage(event);
+        return;
     }
 	pebs_buffer_reset(buf, &pebs->handle);
     //FIXME! if configuration of ds buffer failed then we should not enabling it
@@ -393,13 +415,16 @@ static void pebs_event_start(struct perf_event *event, int flags)
     
     wmb();
 	ACCESS_ONCE(pebs->started) = 1;
-    x86_pmu_enable(event->pmu);
+    //x86_pmu_enable(event->pmu);
+    x86_pmu.enable(event);
+    //perf_event_update_userpage(event);
 }
 
 static void pebs_event_stop(struct perf_event *event, int flags)
 {
 	struct pebs_ctx *pebs = this_cpu_ptr(&pebs_ctx);
 	struct cpu_hw_events *cpuc = this_cpu_ptr(&cpu_hw_events);
+    struct hw_perf_event *hwc = &event->hw;
 
 #if _DEBUG_
 	printk("pebs_event_stop @cpu%d : %s\n",
@@ -408,15 +433,23 @@ static void pebs_event_stop(struct perf_event *event, int flags)
     dump_events();
 #endif
     //disable before recover ds
-    x86_pmu_disable(event->pmu);
-	recover_ds(pebs, cpuc);
-
-    ACCESS_ONCE(event->hw.state) |= PERF_HES_STOPPED | PERF_HES_UPTODATE;
-	ACCESS_ONCE(pebs->started) = 0;
+    if (__test_and_clear_bit(hwc->idx, cpuc->active_mask))
+    {
+        x86_pmu.disable(event);
+        cpuc->events[hwc->idx] = NULL;
+        hwc->state |= PERF_HES_STOPPED | PERF_HES_UPTODATE;
+    }
+    if (event->group_leader==event)
+    {
+        //only group leader is responsible for recovering the DS
+    	recover_ds(pebs, cpuc);
+	    ACCESS_ONCE(pebs->started) = 0;
+    }
 }
 ///////////////////////////////////////////////////////////////////////////////
 /*
  * drain pebs buffer, using aux buffer
+ * FIXME: need to set to stop if there's error
  */
 int intel_pebs_drain(bool terminate)
 {
@@ -428,8 +461,6 @@ int intel_pebs_drain(bool terminate)
     unsigned long left = 0;
     unsigned int next_buf;
 
-    //FIXME: why not &&?
-    //if ((!pebs) || (!ACCESS_ONCE(pebs->started)))
     if ((!pebs) && (!ACCESS_ONCE(pebs->started)))
         return 0;
 
@@ -439,7 +470,9 @@ int intel_pebs_drain(bool terminate)
     if (terminate)
         return 1;
 
-    event = pebs->handle.event;
+    //this event should be group leader
+    event = pebs->handle.event->group_leader;
+    
 #if _DEBUG_
 	printk("@cpu%d intel_pebs_drain : \n", smp_processor_id());
 #endif
@@ -580,7 +613,6 @@ static void pebs_event_del(struct perf_event *event, int mode)
 
 	if (event->attr.type != pebs_pmu.type)
 		return;
-
 #if _DEBUG_
 	printk("pebs_event_del: @cpu%d: mode %d\n",
 			smp_processor_id(),
@@ -588,17 +620,19 @@ static void pebs_event_del(struct perf_event *event, int mode)
     dump_events();
 #endif
 
-	if ((ACCESS_ONCE(pebs->aux_started)==1)
-        && (buf!=NULL))
+    if (event->group_leader==event)
     {
-        //printk("pebs_event_del: aux output buf %p\n", buf);
-        pebs_update(pebs);
-        //perf_aux_output_end_pebs(&pebs->handle, 0, 0);
-        perf_aux_output_end_pebs(&pebs->handle, local_xchg(&buf->data_size, 0),
-                !!local_xchg(&buf->lost, 0));
+        if ((ACCESS_ONCE(pebs->aux_started)==1)
+            && (buf!=NULL))
+        {
+            //printk("pebs_event_del: aux output buf %p\n", buf);
+            pebs_update(pebs);
+            //perf_aux_output_end_pebs(&pebs->handle, 0, 0);
+            perf_aux_output_end_pebs(&pebs->handle, local_xchg(&buf->data_size, 0),
+                    !!local_xchg(&buf->lost, 0));
+        }
+        ACCESS_ONCE(pebs->aux_started) = 0;
     }
-    ACCESS_ONCE(pebs->aux_started) = 0;
-
 	/*
 	 * call x86_pmu to handler reset of the work
 	 * will reset several counter to 0
@@ -609,8 +643,17 @@ static void pebs_event_del(struct perf_event *event, int mode)
 
 	x86_pmu_del(event, mode);
 
-	pebs_event_stop(event, PERF_EF_UPDATE);
-    ACCESS_ONCE(pebs->added_event)=0;
+    ACCESS_ONCE(event->hw.state) |= PERF_HES_STOPPED | PERF_HES_UPTODATE;
+    //for aux ds related thing
+    if (event->group_leader==event)
+    {
+        //only group leader is responsible for recovering the DS
+    	recover_ds(pebs, cpuc);
+	    ACCESS_ONCE(pebs->started) = 0;
+    }
+
+    //ACCESS_ONCE?
+    pebs->added_event--;
 }
 
 static int __pebs_event_add(struct perf_event *event, int mode)
@@ -618,6 +661,12 @@ static int __pebs_event_add(struct perf_event *event, int mode)
 	struct pebs_ctx *pebs = this_cpu_ptr(&pebs_ctx);
 	struct cpu_hw_events *cpuc = this_cpu_ptr(&cpu_hw_events);
 	struct pebs_buffer *buf;
+
+    if (event->group_leader!=event)
+    {
+        //only allow group leader to config ds buffer
+        return 0;
+    }
 //////
     backup_ds(pebs, cpuc);
 /////
@@ -653,8 +702,9 @@ static int pebs_event_add(struct perf_event *event, int mode)
 	struct pebs_ctx *pebs = this_cpu_ptr(&pebs_ctx);
 
 	if (event->attr.type != pebs_pmu.type)
+    {
 		return -ENOENT;
-	
+	}
 #if _DEBUG_
 	printk("pebs_event_add: @cpu%d mode 0x%x,"
 		" cpuc->enabled: 0x%x"
@@ -665,36 +715,30 @@ static int pebs_event_add(struct perf_event *event, int mode)
         event->pmu->name);
 #endif
 
-    if (ACCESS_ONCE(pebs->added_event)==1)
+    ret = __pebs_event_add(event, mode);
+    if (ret)
     {
-        //already added?
-        WARN(1, "ALREADY ADDED EVENT!!!\n");
-        BUG();
-        return 0;
-    }
-
-	ret = __pebs_event_add(event, mode);
-	if (ret)
-	{
 #if _DEBUG_
-		printk("  (DIE)@cpu%d __pebs_event_add failed!\n",
-				smp_processor_id());
+        printk("  (DIE)@cpu%d __pebs_event_add failed!\n",
+                smp_processor_id());
 #endif
-		goto out;
-	}
-	ret = x86_pmu_add(event, mode);
-	if (ret)
-	{
-		printk("  (DIE)@cpu%d x86_pmu_add failed!\n",
-				smp_processor_id());
-		goto out;
-	}
-    ACCESS_ONCE(pebs->added_event)=1;
+        goto out;
+    }
+    ret = x86_pmu_add(event, mode);
+    if (ret)
+    {
+        printk("  (DIE)@cpu%d x86_pmu_add failed!\n",
+                smp_processor_id());
+        goto out;
+    }
+    //ACCESS_ONCE??
+    pebs->added_event++;
     /*
      * hw state should be set to stopped and uptodate,
      * x86_pmu_start will examine this bit
      */
-    event->hw.state = PERF_HES_STOPPED | PERF_HES_UPTODATE;
+    //FIXME: already set in x86_pmu_add()?
+    //event->hw.state = PERF_HES_STOPPED | PERF_HES_UPTODATE;
 
 	/*
 	 * call x86_pmu_enable to enable event
@@ -727,15 +771,20 @@ out:
 static void pebs_event_destroy(struct perf_event *event)
 {
 	struct pebs_ctx *pebs = this_cpu_ptr(&pebs_ctx);
+
+    x86_release_hardware();
     x86_del_intel_pebs_usage();
-    //should reset this...
+
+    if (event->group_leader!=event)
+    {
+        return;
+    }
+    //should reset this if this is leader
     if (ACCESS_ONCE(pebs->aux_started)==1)
     {
         WARN(1, "aux_started should be 0 when destroying event\n");
-        pebs_event_del(event, 0);
     }
     ACCESS_ONCE(pebs->aux_started) = 0;
-    ACCESS_ONCE(pebs->added_event) = 0;
 }
 
 static int pebs_event_init(struct perf_event *event)
@@ -747,7 +796,14 @@ static int pebs_event_init(struct perf_event *event)
 	if (event->attr.type != pebs_pmu.type)
 		return -ENOENT;
 
-    ACCESS_ONCE(pebs->aux_started) = 0;
+    //only do this for group leader
+    if (event->group_leader==event)
+    {
+        ACCESS_ONCE(pebs->aux_started) = 0;
+        cpuc->pebs_aux_enabled = 0;
+    }
+
+    event->hw.state = PERF_HES_STOPPED;
 
 #if _DEBUG_
 	printk("pebs_event_init : @cpu%d\n", smp_processor_id());
@@ -765,8 +821,6 @@ static int pebs_event_init(struct perf_event *event)
     //enable NMI handler here
     x86_add_intel_pebs_usage();
     event->destroy = pebs_event_destroy;
-
-    cpuc->pebs_aux_enabled = 0;
 
 	return ret;
 }
@@ -797,8 +851,9 @@ static __init int pebs_init(void)
 	if (!boot_cpu_has(X86_FEATURE_DTES64) || !x86_pmu.pebs)
 		return -ENODEV;
 
-	pebs_pmu.capabilities	= PERF_PMU_CAP_AUX_NO_SG | PERF_PMU_CAP_AUX_SW_DOUBLEBUF;
-	pebs_pmu.capabilities	|= PERF_PMU_CAP_EXCLUSIVE;
+	//pebs_pmu.capabilities	= PERF_PMU_CAP_AUX_NO_SG | PERF_PMU_CAP_AUX_SW_DOUBLEBUF;
+	//pebs_pmu.capabilities	|= PERF_PMU_CAP_EXCLUSIVE;
+    pebs_pmu.capabilities  = PERF_PMU_CAP_AUX_NO_SG;
 	pebs_pmu.attr_groups	= x86_pmu_attr_groups;
     //???
 	pebs_pmu.task_ctx_nr	= perf_hw_context;

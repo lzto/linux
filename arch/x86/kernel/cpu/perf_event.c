@@ -833,6 +833,10 @@ int perf_assign_events(struct event_constraint **constraints, int n,
 }
 EXPORT_SYMBOL_GPL(perf_assign_events);
 
+/*
+ * this one is used to calculate whether multiple events can be scheduled
+ * to run together
+ */
 int x86_schedule_events(struct cpu_hw_events *cpuc, int n, int *assign)
 {
 	struct event_constraint *c;
@@ -1183,10 +1187,11 @@ int x86_pmu_add(struct perf_event *event, int flags)
 	struct hw_perf_event *hwc;
 	int assign[X86_PMC_IDX_MAX];
 	int n, n0, ret;
+    int i;
 
     //printk("x86_pmu_add\n");
     //union x86_pmu_config *cfg = &(event->attr.config);
-    //printk("...uevent:%d, umask%d\n",cfg->bits.event, cfg->bits.umask);
+    //printk("...uevent:0x%x, umask:0x%x\n",cfg->bits.event, cfg->bits.umask);
 
 	hwc = &event->hw;
 
@@ -1209,7 +1214,7 @@ int x86_pmu_add(struct perf_event *event, int flags)
 		goto done_collect;
 
 	ret = x86_pmu.schedule_events(cpuc, n, assign);
-    //printk(".... schedule_events:%d\n", ret);
+    //printk(".... schedule_events ret:%d\n", ret);
 	if (ret)
 		goto out;
 	/*
@@ -1217,7 +1222,14 @@ int x86_pmu_add(struct perf_event *event, int flags)
 	 * will be used by hw_perf_enable()
 	 */
 	memcpy(cpuc->assign, assign, n*sizeof(int));
-
+    #if 0
+    printk(".... schedule result:");
+    for (i=0;i<X86_PMC_IDX_MAX;i++)
+    {
+        printk("%d,", assign[i]);
+    }
+    printk("\n");
+    #endif
 done_collect:
 	/*
 	 * Commit the collect_events() state. See x86_pmu_del() and
@@ -1238,10 +1250,10 @@ void x86_pmu_start(struct perf_event *event, int flags)
 	struct cpu_hw_events *cpuc = this_cpu_ptr(&cpu_hw_events);
 	int idx = event->hw.idx;
 
-	if (WARN_ON_ONCE(!(event->hw.state & PERF_HES_STOPPED)))
+	if (!(event->hw.state & PERF_HES_STOPPED))
 		return;
 
-	if (WARN_ON_ONCE(idx == -1))
+	if (idx == -1)
 		return;
 
 	if (flags & PERF_EF_RELOAD) {
