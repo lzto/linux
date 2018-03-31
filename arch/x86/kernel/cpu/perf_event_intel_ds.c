@@ -1,6 +1,7 @@
 #include <linux/bitops.h>
 #include <linux/types.h>
 #include <linux/slab.h>
+#include <linux/random.h>
 
 #include <asm/perf_event.h>
 #include <asm/insn.h>
@@ -744,6 +745,10 @@ struct event_constraint intel_skl_pebs_event_constraints[] = {
 	INTEL_FLAGS_EVENT_CONSTRAINT(0x108001c0, 0x2),
 	/* INST_RETIRED.TOTAL_CYCLES_PS (inv=1, cmask=16) (cycles:p). */
 	INTEL_FLAGS_EVENT_CONSTRAINT(0x108000c0, 0x0f),
+    //according to SDM Vol 3.B  Table 18-56, MEM_INST_RETIRED should have cmask=10 and inv=1
+	INTEL_FLAGS_EVENT_CONSTRAINT(0x108081d0, 0x0f),
+	INTEL_FLAGS_EVENT_CONSTRAINT(0x108081d0, 0x0f),
+
 	INTEL_PLD_CONSTRAINT(0x1cd, 0xf),		      /* MEM_TRANS_RETIRED.* */
 	INTEL_FLAGS_UEVENT_CONSTRAINT_DATALA_LD(0x11d0, 0xf), /* MEM_INST_RETIRED.STLB_MISS_LOADS */
 	INTEL_FLAGS_UEVENT_CONSTRAINT_DATALA_ST(0x12d0, 0xf), /* MEM_INST_RETIRED.STLB_MISS_STORES */
@@ -795,6 +800,7 @@ void intel_pmu_pebs_enable(struct perf_event *event)
 	bool first_pebs;
 	u64 threshold;
 	int max_samples;
+    //u64 rand_period;
 
 	hwc->config &= ~ARCH_PERFMON_EVENTSEL_INT;
 
@@ -833,9 +839,17 @@ void intel_pmu_pebs_enable(struct perf_event *event)
 	}
 	/* Use auto-reload if possible to save a MSR write in the PMI */
 	if (hwc->flags & PERF_X86_EVENT_AUTO_RELOAD) {
-        //printk("PEBS: setting sample_period=%llu\n", hwc->sample_period);
+        //add randomness here for better sampling coverage
+        //get <10% randomness of original sampling period
+        //get_random_bytes(&rand_period, sizeof(u64));
+        //rand_period = rand_period % 10;
+        //rand_period = (hwc->sample_period) * (100+rand_period) / 100;
+        //printk("PEBS: setting sample_period=%llu, ~ %llu\n", hwc->sample_period, rand_period);
 		ds->pebs_event_reset[hwc->idx] =
 			(u64)(-hwc->sample_period) & x86_pmu.cntval_mask;
+
+		//ds->pebs_event_reset[hwc->idx] =
+		//	(u64)(-rand_period) & x86_pmu.cntval_mask;
 	}
 
 	if (first_pebs || ds->pebs_interrupt_threshold > threshold)
