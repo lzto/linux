@@ -2585,12 +2585,13 @@ static int intel_pmu_hw_config(struct perf_event *event)
 		return ret;
 
 	if (event->attr.precise_ip) {
-		if (!event->attr.freq) {
+        //allow freq with free running, although we can not control very precisely
+		//if (!event->attr.freq) {
 			event->hw.flags |= PERF_X86_EVENT_AUTO_RELOAD;
 			if (!(event->attr.sample_type &
 			      ~intel_pmu_free_running_flags(event)))
 				event->hw.flags |= PERF_X86_EVENT_FREERUNNING;
-		}
+		//}
 		if (x86_pmu.pebs_aliases)
 			x86_pmu.pebs_aliases(event);
 	}

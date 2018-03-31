@@ -470,13 +470,15 @@ void perf_sample_event_took(u64 sample_len_ns)
 
 	if (max_samples_per_tick <= 1)
 		return;
-#if 0
+
+#if 1
 	max_samples_per_tick = DIV_ROUND_UP(max_samples_per_tick, 2);
 	sysctl_perf_event_sample_rate = max_samples_per_tick * HZ;
 	perf_sample_period_ns = NSEC_PER_SEC / sysctl_perf_event_sample_rate;
 
 	update_perf_cpu_limits();
 #endif
+
 	if (!irq_work_queue(&perf_duration_work)) {
 		early_printk("perf interrupt took too long (%lld > %lld), lowering "
 			     "kernel.perf_event_max_sample_rate to %d\n",
@@ -6663,7 +6665,8 @@ static int __perf_event_overflow(struct perf_event *event,
 
 	if (event->attr.freq) {
 		u64 now = perf_clock();
-		s64 delta = now - hwc->freq_time_stamp;
+        //adjust this for PEBS driver
+		s64 delta = (now - hwc->freq_time_stamp)/(hwc->interrupts);
 
 		hwc->freq_time_stamp = now;
 

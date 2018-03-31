@@ -833,6 +833,7 @@ void intel_pmu_pebs_enable(struct perf_event *event)
 	}
 	/* Use auto-reload if possible to save a MSR write in the PMI */
 	if (hwc->flags & PERF_X86_EVENT_AUTO_RELOAD) {
+        //printk("PEBS: setting sample_period=%llu\n", hwc->sample_period);
 		ds->pebs_event_reset[hwc->idx] =
 			(u64)(-hwc->sample_period) & x86_pmu.cntval_mask;
 	}
@@ -1359,8 +1360,12 @@ static void intel_pmu_drain_pebs_nhm(struct pt_regs *iregs)
 			continue;
 
 		event = cpuc->events[bit];
-		WARN_ON_ONCE(!event);
-		WARN_ON_ONCE(!event->attr.precise_ip);
+        if (!event)
+        {
+            return;
+        }
+		//WARN_ON_ONCE(!event);
+		//WARN_ON_ONCE(!event->attr.precise_ip);
 
 		/* log dropped samples number */
 		if (error[bit])

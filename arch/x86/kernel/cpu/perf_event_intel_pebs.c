@@ -130,29 +130,30 @@ inline static void backup_ds(struct pebs_ctx* pebs, struct cpu_hw_events *cpuc)
 
 inline static void recover_ds(struct pebs_ctx* pebs, struct cpu_hw_events *cpuc)
 {
-	if(pebs->valid)
+	if(!pebs->valid)
 	{
-        if (!cpuc->ds)
-        {
-            printk("how come ds is NULL?!!!\n");
-            pebs->valid = 0;
-            return;
-        }
-		cpuc->ds->pebs_buffer_base = pebs->ds_back.pebs_buffer_base;
-		cpuc->ds->pebs_index = pebs->ds_back.pebs_index;
-		cpuc->ds->pebs_absolute_maximum = 
-			pebs->ds_back.pebs_absolute_maximum;
-		/*
-		 * trick intel_pmu_pebs_disable to believe
-		 * we are using large buffer, otherwise there will be problem!
-		 */
-		//cpuc->ds->pebs_interrupt_threshold 
-		//	= pebs->ds_back.pebs_interrupt_threshold;
-		cpuc->ds->pebs_interrupt_threshold
-			= pebs->ds_back.pebs_buffer_base + 401;
-		pebs->valid = 0;
-        wmb();
-	}
+        return;
+    }
+    if (!cpuc->ds)
+    {
+        printk("how come ds is NULL?!!!\n");
+        pebs->valid = 0;
+        return;
+    }
+    cpuc->ds->pebs_buffer_base = pebs->ds_back.pebs_buffer_base;
+    cpuc->ds->pebs_index = pebs->ds_back.pebs_index;
+    cpuc->ds->pebs_absolute_maximum = 
+        pebs->ds_back.pebs_absolute_maximum;
+    /*
+     * trick intel_pmu_pebs_disable to believe
+     * we are using large buffer, otherwise there will be problem!
+     */
+    //cpuc->ds->pebs_interrupt_threshold 
+    //	= pebs->ds_back.pebs_interrupt_threshold;
+    cpuc->ds->pebs_interrupt_threshold
+        = pebs->ds_back.pebs_buffer_base + 401;
+    pebs->valid = 0;
+    wmb();
 }
 
 /*
@@ -326,7 +327,7 @@ static void pebs_update(struct pebs_ctx *pebs)
 	u64 head;
     if (!ds)
     {
-        printk("How come ds is null???!!!\n");
+        WARN(1, "PEBS: DS is NULL?\n");
         return;
     }
 
@@ -386,16 +387,23 @@ static void pebs_event_start(struct perf_event *event, int flags)
     struct cpu_hw_events *cpuc = this_cpu_ptr(&cpu_hw_events);
     int idx = event->hw.idx;
 
+    //FIXME: should handle PERF_EF_RELOAD
     if (!buf)
     {
         WARN(1, "pebs_event_start get aux buffer null???\n");
 		return;
     }
-    
+
+
     if (!(event->hw.state & PERF_HES_STOPPED))
         return;
     if (idx==-1)
         return;
+
+    if (flags==PERF_EF_RELOAD)
+    {
+		x86_perf_event_set_period(event);
+    }
 
     event->hw.state = 0;
     cpuc->events[idx] = event;
@@ -405,9 +413,8 @@ static void pebs_event_start(struct perf_event *event, int flags)
     if (event->group_leader!=event)
     {
         //only group leader is allowed to start the group
-        //x86_pmu_enable(event->pmu);
         x86_pmu.enable(event);
-        //perf_event_update_userpage(event);
+        perf_event_update_userpage(event);
         return;
     }
 	pebs_buffer_reset(buf, &pebs->handle);
@@ -416,9 +423,8 @@ static void pebs_event_start(struct perf_event *event, int flags)
     
     wmb();
 	ACCESS_ONCE(pebs->started) = 1;
-    //x86_pmu_enable(event->pmu);
     x86_pmu.enable(event);
-    //perf_event_update_userpage(event);
+    perf_event_update_userpage(event);
 }
 
 static void pebs_event_stop(struct perf_event *event, int flags)
@@ -440,10 +446,13 @@ static void pebs_event_stop(struct perf_event *event, int flags)
         cpuc->events[hwc->idx] = NULL;
         hwc->state |= PERF_HES_STOPPED | PERF_HES_UPTODATE;
     }
+    //FIXME: should handle PERF_EF_UPDATE
+    //if (flags==PERF_EF_UPDATE)
+    //    return;
     if (event->group_leader==event)
     {
-        //only group leader is responsible for recovering the DS
-    	recover_ds(pebs, cpuc);
+        //only do recover on error and del
+    	//recover_ds(pebs, cpuc);
 	    ACCESS_ONCE(pebs->started) = 0;
     }
 }
@@ -456,42 +465,44 @@ int intel_pebs_drain(bool terminate)
 {
 	struct pebs_ctx *pebs = this_cpu_ptr(&pebs_ctx);
 	struct cpu_hw_events *cpuc = this_cpu_ptr(&cpu_hw_events);
-	struct perf_event *event;
+	struct perf_event *event, *leader;
 	struct pebs_buffer *buf;
     struct pebs_phys *phys;
     unsigned long left = 0;
     unsigned int next_buf;
-
-    if ((!pebs) && (!ACCESS_ONCE(pebs->started)))
-        return 0;
-
-	if (!x86_pmu.pebs_active)
-		return 0;
+    unsigned int records = 0;
+    struct perf_sample_data data;
+    struct pt_regs regs;
 
     if (terminate)
         return 1;
-
-    //this event should be group leader
-    event = pebs->handle.event->group_leader;
-    
-#if _DEBUG_
-	printk("@cpu%d intel_pebs_drain : \n", smp_processor_id());
-#endif
-	if (!event)
+    if (!pebs)
+        return 0;
+    if (!ACCESS_ONCE(pebs->started))
+        return 0;
+    if (!pebs->aux_started)
+        return 0;
+	if (!x86_pmu.pebs_active)
+		return 0;
+    if (!pebs->handle.event)
     {
+        WARN(1, "event is NULL?");
         return 0;
     }
+    //this event should be group leader
+    event = pebs->handle.event->group_leader;
 
     buf = perf_get_aux_pebs(&pebs->handle);
     if (!buf)
     {
-        //already stopped??
+        BUG();
         return -2;
     }
 
     //when will pebs becomes valid?
     if (pebs->valid==0)
     {
+        WARN(1, "PEBS backup should be valid before doing drain!\n");
         backup_ds(pebs, cpuc);
         goto retry_aux;
     }
@@ -502,64 +513,44 @@ int intel_pebs_drain(bool terminate)
 	{
 		return 1;
 	}
-    if (ACCESS_ONCE(pebs->aux_started))
-    {
-        //PEBS started and collected data
-        phys = &buf->buf[buf->cur_buf];
-        left = phys->size - local_read(&buf->data_size);
-        //printk("writing %lu bytes, skipping %lu bytes..\n", local_read(&buf->data_size), left);
 
-        perf_aux_output_end_pebs(&pebs->handle, local_xchg(&buf->data_size, 0),
-                !!local_xchg(&buf->lost, 0));
-        //skip the rest of this buffer
-        if (left>0)
-        {
-	        buf = perf_aux_output_begin_pebs(&pebs->handle, event);
-            if (!buf)
-            {
-                ACCESS_ONCE(pebs->aux_started) = 0;
-                //can not skip the rest of the buffer???
-                goto retry_aux;
-            }
-            perf_aux_output_skip_pebs(&pebs->handle, left);
-            perf_aux_output_end_pebs(&pebs->handle, 0, 0);
-        }else if (left<0)
-        {
-            BUG();
-        }
-        ACCESS_ONCE(pebs->aux_started) = 0;
-    }
-retry_aux:
-    if (terminate)
-    {
-        if (ACCESS_ONCE(pebs->aux_started))
-        {
-            ACCESS_ONCE(pebs->aux_started) = 0;
-            perf_aux_output_end_pebs(&pebs->handle, 0, 0);
-        }
-        recover_ds(pebs, cpuc);
-        return 1;
-    }
+    //PEBS started and collected data
+    phys = &buf->buf[buf->cur_buf];
+    left = phys->size - local_read(&buf->data_size);
+    //printk("writing %lu bytes, skipping %lu bytes..\n", local_read(&buf->data_size), left);
+    records = (int)((local_read(&buf->data_size))/200);
 
-//FIXME: send dummy perf event to userspace
-    struct perf_sample_data data;
-    struct pt_regs regs;
+    perf_aux_output_end_pebs(&pebs->handle, local_xchg(&buf->data_size, 0),
+            !!local_xchg(&buf->lost, 0));
+
+    //update interrupt
+    event->hw.interrupts += records;
+    event->pending_kill = POLL_IN;
+    //send dummy perf event to userspace?
     perf_event_overflow(event, &data, &regs);
 
+    //skip the rest of this buffer
+    if (left>0)
+    {
+        buf = perf_aux_output_begin_pebs(&pebs->handle, event);
+        if (!buf)
+        {
+            //can not skip the rest of the buffer???
+            goto stop_and_err;
+        }
+        perf_aux_output_skip_pebs(&pebs->handle, left);
+        perf_aux_output_end_pebs(&pebs->handle, 0, 0);
+    }
+
+retry_aux:
 	buf = perf_aux_output_begin_pebs(&pebs->handle, event);
-    ACCESS_ONCE(pebs->aux_started) = 1;
-//
-//
 	if (!buf)
 	{
-		//WARN(1," (DIE)@cpu%d intel_pebs_drain : buf null? #2\n",
-		//		smp_processor_id());
 		/*
 		 * unable to get free buffer, better luck next time!
 		 * program will continue running
 		 * record sample lost!
 		 */
-        ACCESS_ONCE(pebs->aux_started) = 0;
 		goto stop_and_err;
 	}
     //figure out current buffer
@@ -573,10 +564,16 @@ retry_aux:
 	return 1;
 
 stop_and_err:
-    printk("pebs_interrupt handler error, recover ds\n");
-    //dump_events();
-    recover_ds(pebs, cpuc);
+    ACCESS_ONCE(pebs->aux_started) = 0;
+    //printk("pebs_interrupt handler error, recover ds\n");
     //BUG();
+    //should stop events
+    leader = event;
+	list_for_each_entry(event, &leader->sibling_list, group_entry)
+    {
+        event->hw.state |= PERF_HES_STOPPED;
+    }
+    recover_ds(pebs, cpuc);
 	return -1;
 }
 
@@ -585,20 +582,6 @@ stop_and_err:
  */
 int intel_pebs_interrupt(void)
 {
-	struct pebs_ctx *pebs = this_cpu_ptr(&pebs_ctx);
-    struct perf_event *event = pebs->handle.event;
-
-    if (!event)
-        return 0;
-
-#if _DEBUG_
-	printk("(@cpu%d) intel_pebs_interrupt(started:?%d) : \n",
-			smp_processor_id(),
-			pebs->started);
-#endif
-	if (!ACCESS_ONCE(pebs->started))
-		return 0;
-
 	return intel_pebs_drain(false);
 }
 
@@ -633,6 +616,7 @@ static void pebs_event_del(struct perf_event *event, int mode)
                     !!local_xchg(&buf->lost, 0));
         }
         ACCESS_ONCE(pebs->aux_started) = 0;
+    	recover_ds(pebs, cpuc);
     }
 	/*
 	 * call x86_pmu to handler reset of the work
@@ -645,15 +629,7 @@ static void pebs_event_del(struct perf_event *event, int mode)
 	x86_pmu_del(event, mode);
 
     ACCESS_ONCE(event->hw.state) |= PERF_HES_STOPPED | PERF_HES_UPTODATE;
-    //for aux ds related thing
-    if (event->group_leader==event)
-    {
-        //only group leader is responsible for recovering the DS
-    	recover_ds(pebs, cpuc);
-	    ACCESS_ONCE(pebs->started) = 0;
-    }
 
-    //ACCESS_ONCE?
     pebs->added_event--;
 }
 
@@ -684,14 +660,16 @@ static int __pebs_event_add(struct perf_event *event, int mode)
 
 	if (!buf)
     {
-        WARN(1, "__pebs_event_add: aux output begin returned NULL?\n");
+        //WARN(1, "__pebs_event_add: aux output begin returned NULL?\n");
+        recover_ds(pebs, cpuc);
+        ACCESS_ONCE(pebs->aux_started) = 0;
 		return -EINVAL;
     }
 
-    ACCESS_ONCE(pebs->aux_started) = 1;
-	
 	pebs_buffer_reset(buf, &pebs->handle);
 	pebs_config_buffer(buf);
+
+    ACCESS_ONCE(pebs->aux_started) = 1;
 
 	return 0;
 }
@@ -699,7 +677,7 @@ static int __pebs_event_add(struct perf_event *event, int mode)
 static int pebs_event_add(struct perf_event *event, int mode)
 {
 	int ret;
-	struct cpu_hw_events *cpuc = this_cpu_ptr(&cpu_hw_events);
+	//struct cpu_hw_events *cpuc = this_cpu_ptr(&cpu_hw_events);
 	struct pebs_ctx *pebs = this_cpu_ptr(&pebs_ctx);
 
 	if (event->attr.type != pebs_pmu.type)
@@ -719,27 +697,14 @@ static int pebs_event_add(struct perf_event *event, int mode)
     ret = __pebs_event_add(event, mode);
     if (ret)
     {
-#if _DEBUG_
-        printk("  (DIE)@cpu%d __pebs_event_add failed!\n",
-                smp_processor_id());
-#endif
         goto out;
     }
     ret = x86_pmu_add(event, mode);
     if (ret)
     {
-        printk("  (DIE)@cpu%d x86_pmu_add failed!\n",
-                smp_processor_id());
         goto out;
     }
-    //ACCESS_ONCE??
     pebs->added_event++;
-    /*
-     * hw state should be set to stopped and uptodate,
-     * x86_pmu_start will examine this bit
-     */
-    //FIXME: already set in x86_pmu_add()?
-    //event->hw.state = PERF_HES_STOPPED | PERF_HES_UPTODATE;
 
 	/*
 	 * call x86_pmu_enable to enable event
@@ -747,25 +712,9 @@ static int pebs_event_add(struct perf_event *event, int mode)
 	 */
 	if (mode & PERF_EF_START)
 	{
-#if _DEBUG_
-		printk("@cpu%d event->hwc.idx=?0x%x,"
-			"  cpuc->n_events=%d,"
-			"  cpuc->active_mask:%p\n",
-				smp_processor_id(),
-				event->hw.idx,
-				cpuc->n_events,
-				cpuc->active_mask);
-#endif
         pebs_event_start(event, mode);
 	}
 out:
-#if _DEBUG_
-	printk("pebs_event_add: @cpu%d ret=%d(should be 0)\n",
-			smp_processor_id(),
-			ret);
-    dump_events();
-#endif
-
 	return ret;
 }
 

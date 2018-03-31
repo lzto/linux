@@ -1187,7 +1187,7 @@ int x86_pmu_add(struct perf_event *event, int flags)
 	struct hw_perf_event *hwc;
 	int assign[X86_PMC_IDX_MAX];
 	int n, n0, ret;
-    int i;
+    //int i;
 
     //printk("x86_pmu_add\n");
     //union x86_pmu_config *cfg = &(event->attr.config);
@@ -1357,8 +1357,6 @@ void x86_pmu_del(struct perf_event *event, int flags)
 {
 	struct cpu_hw_events *cpuc = this_cpu_ptr(&cpu_hw_events);
 	int i;
-
-	//printk(" x86_pmu_del\n");
 
 	/*
 	 * event is descheduled
