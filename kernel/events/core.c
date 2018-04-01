@@ -471,7 +471,8 @@ void perf_sample_event_took(u64 sample_len_ns)
 	if (max_samples_per_tick <= 1)
 		return;
 
-#if 1
+#if 0
+//here we will adjust perf_event_sample_rate
 	max_samples_per_tick = DIV_ROUND_UP(max_samples_per_tick, 2);
 	sysctl_perf_event_sample_rate = max_samples_per_tick * HZ;
 	perf_sample_period_ns = NSEC_PER_SEC / sysctl_perf_event_sample_rate;
@@ -6646,14 +6647,19 @@ static int __perf_event_overflow(struct perf_event *event,
 
 	seq = __this_cpu_read(perf_throttled_seq);
 	if (seq != hwc->interrupts_seq) {
+        //printk("throttle perf, reset interrupts=1, seq=%llu, hwc.irq.seq=%llu\n",
+        //    seq, hwc->interrupts_seq);
 		hwc->interrupts_seq = seq;
 		hwc->interrupts = 1;
 	} else {
 		hwc->interrupts++;
-#if 0
-//disable throttling
+#if 1
+//throttling
 		if (unlikely(throttle
 			     && hwc->interrupts >= max_samples_per_tick)) {
+            //printk("throttle perf: interrupt=%llu, max_sample_per_tick=%llu\n",
+            //    hwc->interrupts, max_samples_per_tick);
+
 			__this_cpu_inc(perf_throttled_count);
 			hwc->interrupts = MAX_INTERRUPTS;
 			perf_log_throttle(event, 0);
@@ -6665,8 +6671,9 @@ static int __perf_event_overflow(struct perf_event *event,
 
 	if (event->attr.freq) {
 		u64 now = perf_clock();
+		s64 delta = (now - hwc->freq_time_stamp);
         //adjust this for PEBS driver
-		s64 delta = (now - hwc->freq_time_stamp)/(hwc->interrupts);
+		//s64 delta = (now - hwc->freq_time_stamp)/(hwc->interrupts);
 
 		hwc->freq_time_stamp = now;
 

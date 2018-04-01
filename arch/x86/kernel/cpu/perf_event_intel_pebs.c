@@ -378,8 +378,9 @@ static int pebs_buffer_reset(struct pebs_buffer *buf,
 	return 0;
 }
 
-///////////////////////////////////////////////////////////////////////////////
-// START/STOP is not called directly anyway???
+//FIXME: add throttling, record timestamp when calling start, drain
+//accumulate total number of records during one sec if > threshold, then stop
+//sampling
 static void pebs_event_start(struct perf_event *event, int flags)
 {
 	struct pebs_ctx *pebs = this_cpu_ptr(&pebs_ctx);
@@ -387,18 +388,17 @@ static void pebs_event_start(struct perf_event *event, int flags)
     struct cpu_hw_events *cpuc = this_cpu_ptr(&cpu_hw_events);
     int idx = event->hw.idx;
 
+    if (!(event->hw.state & PERF_HES_STOPPED))
+        return;
+    if (idx==-1)
+        return;
+
     //FIXME: should handle PERF_EF_RELOAD
     if (!buf)
     {
         WARN(1, "pebs_event_start get aux buffer null???\n");
 		return;
     }
-
-
-    if (!(event->hw.state & PERF_HES_STOPPED))
-        return;
-    if (idx==-1)
-        return;
 
     if (flags==PERF_EF_RELOAD)
     {
@@ -459,8 +459,8 @@ static void pebs_event_stop(struct perf_event *event, int flags)
 ///////////////////////////////////////////////////////////////////////////////
 /*
  * drain pebs buffer, using aux buffer
- * FIXME: need to set to stop if there's error
  */
+#define MAX_INTERRUPTS (~0ULL)
 int intel_pebs_drain(bool terminate)
 {
 	struct pebs_ctx *pebs = this_cpu_ptr(&pebs_ctx);
@@ -525,9 +525,19 @@ int intel_pebs_drain(bool terminate)
 
     //update interrupt
     event->hw.interrupts += records;
+    //event->hw.interrupts++;
     event->pending_kill = POLL_IN;
     //send dummy perf event to userspace?
-    perf_event_overflow(event, &data, &regs);
+    if (perf_event_overflow(event, &data, &regs))
+    {
+        //means we are throttled, we need to stop
+        //leader = event;
+        //list_for_each_entry(event, &leader->sibling_list, group_entry)
+        //{
+        //    event->hw.interrupts = MAX_INTERRUPTS;
+        //}
+        goto stop_and_err;
+    }
 
     //skip the rest of this buffer
     if (left>0)
@@ -571,7 +581,8 @@ stop_and_err:
     leader = event;
 	list_for_each_entry(event, &leader->sibling_list, group_entry)
     {
-        event->hw.state |= PERF_HES_STOPPED;
+        //event->hw.state |= PERF_HES_STOPPED;
+        pebs_event_stop(event, 0);
     }
     recover_ds(pebs, cpuc);
 	return -1;
@@ -668,6 +679,7 @@ static int __pebs_event_add(struct perf_event *event, int mode)
 
 	pebs_buffer_reset(buf, &pebs->handle);
 	pebs_config_buffer(buf);
+    wmb();
 
     ACCESS_ONCE(pebs->aux_started) = 1;
 
