@@ -40,9 +40,7 @@ static int qnx4_match(int len, const char *name,
 	} else {
 		namelen = QNX4_SHORT_NAME_MAX;
 	}
-	thislen = strlen( de->di_fname );
-	if ( thislen > namelen )
-		thislen = namelen;
+	thislen = strnlen( de->di_fname, namelen );
 	if (len != thislen) {
 		return 0;
 	}
