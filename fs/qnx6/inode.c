@@ -447,6 +447,11 @@ mmi_success:
 		ret = PTR_ERR(root);
 		goto out2;
 	}
+	if (!S_ISDIR(root->i_mode)) {
+		pr_err("wrong root inode type\n");
+		ret = -EINVAL;
+		goto out2;
+	}
 
 	ret = -ENOMEM;
 	s->s_root = d_make_root(root);
